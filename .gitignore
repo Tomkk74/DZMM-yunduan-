@@ -10,3 +10,10 @@ Thumbs.db
 *.log
 .pull_cache/
 _tmp*
+_rewrite*.py
+node_modules/
+package.json
+package-lock.json
+docs/_capture_shots.mjs
+.git/COMMIT_MSG.txt
+.git/CLEAN_MSG.txt
