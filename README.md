@@ -1,5 +1,7 @@
 # DZMM 本地开发控制台
 
+**交流群（Discord）**：[https://discord.gg/da9PMeAGGK](https://discord.gg/da9PMeAGGK)
+
 独立可分享的 **Local Bridge**：在浏览器里登录 DZMM 账号、绑定 Workbench 角色卡、拉取云端容器到本机，并内嵌启动本地预览。适合需要「改本地文件 → 预览 → 同步/发布」的创作者。
 
 > 仓库地址：<https://github.com/Tomkk74/DZMM-yunduan->
