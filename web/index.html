@@ -21,11 +21,14 @@
       </div>
 
       <nav class="menu" aria-label="功能菜单">
+        <p class="menu-group">游戏卡</p>
         <button type="button" class="menu-item active" data-panel="bridge">云端桥接</button>
         <button type="button" class="menu-item" data-panel="login">账号登录</button>
         <button type="button" class="menu-item" data-panel="project">项目配置</button>
         <button type="button" class="menu-item" data-panel="pull">拉取容器</button>
         <button type="button" class="menu-item" data-panel="status">运行状态</button>
+        <p class="menu-group">角色卡</p>
+        <button type="button" class="menu-item" data-panel="card">本地写卡</button>
       </nav>
 
       <div class="sidebar-scroll">
@@ -82,9 +85,10 @@
               <input id="characterId" name="characterId" type="number" min="1" placeholder="例如 3355944">
             </label>
             <label>
-              <span>本地项目路径</span>
+              <span>本地项目路径（游戏根目录，内含 publish/）</span>
               <input id="projectPath" name="projectPath" type="text" placeholder="D:\path\to\your-game">
             </label>
+            <p class="hint">预览实际打开的是该目录下的 <code>publish/</code>（最终玩家包）。勿直接填到 <code>.../publish</code>。</p>
             <label>
               <span>预览端口</span>
               <input id="previewPort" name="previewPort" type="number" min="1024" max="65535" value="8791">
@@ -116,6 +120,43 @@
           <pre id="statusBox" class="status">加载中…</pre>
           <p class="hint foot-note">账号只存本机 <code>.env</code>，勿分享。</p>
         </section>
+
+        <section class="panel" id="panel-card" data-panel="card" hidden>
+          <h2>本地写卡</h2>
+          <p class="hint">按卡名建文件夹 <code>卡/&lt;卡名&gt;/</code>，编辑其中的 txt 后网页会实时同步。Esc /「菜单」展开侧栏。</p>
+          <label>
+            <span>卡名（文件夹名）</span>
+            <input id="cardFolderName" type="text" placeholder="例：冷面剑修">
+          </label>
+          <label>
+            <span>创意简述</span>
+            <textarea id="cardBrief" rows="4" placeholder="角色定位、时代背景、关系与冲突、语气风格等…"></textarea>
+          </label>
+          <div class="actions">
+            <button type="button" class="btn accent" id="cardAiBtn">创建卡夹并监听</button>
+            <button type="button" class="btn" id="cardNewBtn">新建空白</button>
+          </div>
+          <div class="actions" style="margin-top:8px">
+            <button type="button" class="btn accent" id="cardPublishBtn2" title="保存为云端正式卡">保存到云端</button>
+            <button type="button" class="btn" id="cardDraftBtn2" title="仅云端草稿">云端草稿</button>
+          </div>
+          <p class="hint"><strong>草稿</strong>可删；<strong>已保存</strong>＝正式卡，未上架可隐藏（删除）；<strong>上架/下架请去官网</strong>。游戏卡不可拉到本地。</p>
+          <div class="actions" style="margin-top:8px">
+            <button type="button" class="btn" id="cardRefreshBtn">刷新列表</button>
+            <button type="button" class="btn" id="cardCloudBtn">拉取云端列表</button>
+          </div>
+          <p id="cardMsg" class="hint" style="margin-top:8px">尚未加载</p>
+          <ul id="cardList" class="card-list"></ul>
+          <div id="cloudCardBox" class="cloud-card-box" hidden>
+            <p class="hint">标签：草稿 / 已保存 / 已上架。草稿可删；已保存未上架可隐藏（删除）；上架/下架请去官网。游戏卡不可拉本地。</p>
+            <div class="actions" style="margin-bottom:8px">
+              <button type="button" class="btn" id="cardCloudFilterAll">全部</button>
+              <button type="button" class="btn" id="cardCloudFilterDraft">仅草稿</button>
+              <button type="button" class="btn" id="cardCloudFilterPub">仅已保存</button>
+            </div>
+            <ul id="cloudCardList" class="card-list"></ul>
+          </div>
+        </section>
       </div>
 
       <div class="sidebar-foot">
@@ -124,24 +165,192 @@
     </aside>
 
     <main class="stage">
-      <header class="stage-bar">
-        <div class="stage-title">
-          <strong>本地预览</strong>
-          <span id="previewMeta" class="stage-meta">预览未启动</span>
+      <div id="gameStage" class="stage-mode">
+        <header class="stage-bar">
+          <div class="stage-title">
+            <strong>本地预览</strong>
+            <span id="previewMeta" class="stage-meta">预览未启动</span>
+          </div>
+          <div class="actions stage-actions">
+            <button type="button" class="btn accent" id="previewStartBtn">启动预览</button>
+            <button type="button" class="btn" id="previewReloadBtn" title="只刷新中间预览，不刷新控制台">刷新预览</button>
+            <button type="button" class="btn" id="previewStopBtn">停止</button>
+            <a class="btn" id="previewLink" href="#" target="_blank" rel="noopener">新窗口</a>
+            <button type="button" class="btn" id="sidebarCollapseBtn2" title="收起侧栏">全屏</button>
+          </div>
+        </header>
+        <div class="stage-frame">
+          <iframe id="previewFrame" title="本地游戏预览" src="about:blank"></iframe>
+          <div id="previewEmpty" class="stage-empty">
+            <p>中间为大屏预览区</p>
+            <p>左侧登录并配置项目后，点「启动预览」</p>
+          </div>
         </div>
-        <div class="actions stage-actions">
-          <button type="button" class="btn accent" id="previewStartBtn">启动预览</button>
-          <button type="button" class="btn" id="previewReloadBtn" title="只刷新中间预览，不刷新控制台">刷新预览</button>
-          <button type="button" class="btn" id="previewStopBtn">停止</button>
-          <a class="btn" id="previewLink" href="#" target="_blank" rel="noopener">新窗口</a>
-          <button type="button" class="btn" id="sidebarCollapseBtn2" title="收起侧栏">全屏</button>
+      </div>
+
+      <div id="cardStage" class="stage-mode card-stage" hidden>
+        <header class="stage-bar">
+          <div class="stage-title">
+            <strong>角色卡编辑</strong>
+            <span id="cardStageMeta" class="stage-meta">未打开卡</span>
+          </div>
+          <div class="actions stage-actions">
+            <button type="button" class="btn" id="cardMenuBtn" title="展开左侧菜单">菜单</button>
+            <button type="button" class="btn" id="cardNewBtn2">新建</button>
+            <button type="button" class="btn accent" id="cardAiBtn2">创建卡夹</button>
+            <button type="button" class="btn accent" id="cardSaveBtn">保存到卡夹</button>
+            <button type="button" class="btn accent" id="cardPublishBtn" title="保存为云端正式卡（已保存）">保存到云端</button>
+            <button type="button" class="btn" id="cardDraftBtn" title="仅云端草稿">云端草稿</button>
+            <button type="button" class="btn danger" id="cardDeleteLocalBtn" title="删除当前本地卡夹">删本地卡</button>
+            <button type="button" class="btn" id="cardReloadBtn">重载当前</button>
+          </div>
+        </header>
+        <div id="cardTokenBar" class="card-token-bar" title="估算口径：UTF-8 字节 ÷ 4（近似 GPT / SillyTavern guesstimate），非精确 tokenizer">
+          <div class="card-token-main">
+            <span class="card-token-label">Token</span>
+            <span id="cardTokenSummary" class="card-token-summary">—</span>
+          </div>
+          <div id="cardTokenDetail" class="card-token-detail">编辑卡内容时实时估算</div>
         </div>
-      </header>
-      <div class="stage-frame">
-        <iframe id="previewFrame" title="本地游戏预览" src="about:blank"></iframe>
-        <div id="previewEmpty" class="stage-empty">
-          <p>中间为大屏预览区</p>
-          <p>左侧登录并配置项目后，点「启动预览」</p>
+        <div class="card-editor">
+          <form id="cardForm" class="card-form">
+            <nav class="card-tabs" aria-label="写卡分类">
+              <button type="button" class="card-tab active" data-card-tab="basic">基础</button>
+              <button type="button" class="card-tab" data-card-tab="worldbook">世界书</button>
+              <button type="button" class="card-tab" data-card-tab="dialogue">对话</button>
+              <button type="button" class="card-tab" data-card-tab="media">图片/音色</button>
+            </nav>
+
+            <section class="card-tab-panel active" data-card-panel="basic">
+              <label>
+                <span>创意简述 brief</span>
+                <textarea id="cardBriefMain" rows="2" placeholder="角色定位、背景、关系与冲突、语气风格等…"></textarea>
+              </label>
+              <div class="card-fields-grid">
+                <label>
+                  <span>名称 name</span>
+                  <input id="cardName" type="text" maxlength="80" placeholder="角色名">
+                </label>
+                <label>
+                  <span>标签 tags</span>
+                  <input id="cardTags" type="text" placeholder="逗号分隔">
+                </label>
+                <label>
+                  <span>创作者 creator</span>
+                  <input id="cardCreator" type="text" placeholder="可选">
+                </label>
+                <label>
+                  <span>版本 character_version</span>
+                  <input id="cardVersion" type="text" placeholder="可选">
+                </label>
+                <label class="span-2">
+                  <span>简介 description</span>
+                  <textarea id="cardDescription" rows="4" placeholder="外貌、身份、背景…"></textarea>
+                </label>
+                <label>
+                  <span>性格 personality</span>
+                  <textarea id="cardPersonality" rows="4" placeholder="性格、说话方式…"></textarea>
+                </label>
+                <label>
+                  <span>场景 scenario</span>
+                  <textarea id="cardScenario" rows="4" placeholder="开场处境…"></textarea>
+                </label>
+                <label class="span-2">
+                  <span>系统指令 system_prompt</span>
+                  <textarea id="cardSystemPrompt" rows="4" placeholder="行为规则、立场、知识范围…"></textarea>
+                </label>
+                <label class="span-2">
+                  <span>创作者备注 creator_notes</span>
+                  <textarea id="cardNotes" rows="3" placeholder="给人看的说明"></textarea>
+                </label>
+              </div>
+            </section>
+
+            <section class="card-tab-panel" data-card-panel="worldbook" hidden>
+              <label>
+                <span>世界书名称 character_book.name</span>
+                <input id="cardBookName" type="text" placeholder="世界设定">
+              </label>
+              <p class="hint">对应平台「世界书」步骤。也可直接改文件夹 <code>character_book/entries/001/</code>。</p>
+              <div class="actions" style="margin:8px 0">
+                <button type="button" class="btn accent" id="cardWbAddBtn">新增条目</button>
+              </div>
+              <div id="cardWbEntries" class="wb-entries"></div>
+            </section>
+
+            <section class="card-tab-panel" data-card-panel="dialogue" hidden>
+              <label>
+                <span>开场白 first_mes（兼容；完整模式以对话流为准）</span>
+                <textarea id="cardFirstMes" rows="4" placeholder="角色第一句…"></textarea>
+              </label>
+              <label>
+                <span>建议回复 suggested_replies（一行一条）</span>
+                <textarea id="cardSuggestedReplies" rows="3" placeholder="选项A&#10;选项B"></textarea>
+              </label>
+              <label>
+                <span>开场对话 chat_history.json（高级，JSON）</span>
+                <textarea id="cardChatHistory" rows="10" class="mono" placeholder='[{"id":"1","name":"开场对话","messages":[{"role":"assistant","content":"..."}]}]'></textarea>
+              </label>
+            </section>
+
+            <section class="card-tab-panel" data-card-panel="media" hidden>
+              <h3 class="card-subhead">头像</h3>
+              <div class="avatar-import">
+                <div class="avatar-preview-wrap">
+                  <img id="cardAvatarPreview" alt="头像预览" hidden>
+                  <div id="cardAvatarEmpty" class="avatar-empty">暂无头像</div>
+                </div>
+                <div class="avatar-import-actions">
+                  <label class="btn accent file-btn">
+                    本地导入头像
+                    <input id="cardAvatarFile" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+                  </label>
+                  <p class="hint">保存到 <code>assets/avatar.*</code>。也可填外链。</p>
+                  <label>
+                    <span>头像路径 / URL</span>
+                    <input id="cardAvatarUrl" type="text" placeholder="assets/avatar.png 或 https://...">
+                  </label>
+                </div>
+              </div>
+
+              <h3 class="card-subhead">立绘 image_info</h3>
+              <div class="actions" style="margin-bottom:8px">
+                <label class="btn accent file-btn">
+                  本地导入立绘
+                  <input id="cardImageFile" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
+                </label>
+              </div>
+              <div id="cardImageGallery" class="image-gallery"></div>
+              <details class="card-advanced">
+                <summary>高级：image_info.json</summary>
+                <textarea id="cardImageInfo" rows="5" class="mono" placeholder='[{"url":"...","name":"封面","isHidden":false,"triggerKeywords":[]}]'></textarea>
+              </details>
+
+              <h3 class="card-subhead">音色库 voice（平台）</h3>
+              <div id="cardVoiceSelected" class="voice-selected">未选择音色</div>
+              <div class="voice-toolbar">
+                <input id="cardVoiceSearch" type="text" placeholder="搜索音色名…">
+                <select id="cardVoiceGender">
+                  <option value="all">全部性别</option>
+                  <option value="女">女</option>
+                  <option value="男">男</option>
+                </select>
+                <button type="button" class="btn" id="cardVoiceRefreshBtn">刷新音色库</button>
+                <button type="button" class="btn" id="cardVoiceClearBtn">清除音色</button>
+              </div>
+              <p id="cardVoiceMsg" class="hint">需已登录；点「刷新音色库」加载平台列表。</p>
+              <div id="cardVoiceList" class="voice-list"></div>
+              <details class="card-advanced">
+                <summary>高级：voice_settings.json</summary>
+                <textarea id="cardVoiceSettings" rows="5" class="mono" placeholder="{ }"></textarea>
+              </details>
+            </section>
+
+            <div class="card-live-preview" id="cardLivePreview" hidden>
+              <p class="eyebrow">摘要 · <span id="cardPreviewName">—</span></p>
+              <pre id="cardPreviewBody" class="card-preview-body"></pre>
+            </div>
+          </form>
         </div>
       </div>
     </main>

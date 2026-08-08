@@ -59,6 +59,33 @@ def load_config() -> dict:
     return cfg
 
 
+def normalize_project_root(raw) -> Path:
+    """本地项目路径归一化：始终指向「含 publish/ 的游戏根」。
+
+    常见误填：直接填到 ``.../publish``（最终玩家包目录）。
+    预览/同步都读 ``{root}/publish/``，因此若路径本身已是 publish 包，回退到其上一级。
+    """
+    path = Path(str(raw or "")).expanduser()
+    try:
+        path = path.resolve()
+    except OSError:
+        path = Path(str(raw or "")).expanduser()
+    if (path / "publish" / "index.html").is_file():
+        return path
+    # 用户填了 .../publish 或直接指向玩家包目录
+    if (path / "index.html").is_file() and path.name.lower() == "publish":
+        return path.parent
+    if (path / "index.html").is_file() and (
+        (path / "game.js").is_file() or (path / "style.css").is_file()
+    ):
+        # 独立玩家包目录：若父级已有 publish/ 则用父级，否则仍用该目录的父级以便约定一致
+        parent = path.parent
+        if (parent / "publish" / "index.html").is_file():
+            return parent
+        return parent
+    return path
+
+
 def save_config(updates: dict) -> dict:
     cfg = load_config()
     cfg.update({k: v for k, v in updates.items() if v is not None})
@@ -72,6 +99,8 @@ def save_config(updates: dict) -> dict:
             cfg["preview_port"] = int(cfg["preview_port"] or 8791)
         except Exception:
             cfg["preview_port"] = 8791
+    if cfg.get("project_path"):
+        cfg["project_path"] = str(normalize_project_root(cfg["project_path"]))
     CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return cfg
 
@@ -80,7 +109,7 @@ def project_root() -> Path:
     cfg = load_config()
     raw = (cfg.get("project_path") or "").strip()
     if raw:
-        return Path(raw).expanduser().resolve()
+        return normalize_project_root(raw)
     return KIT_ROOT
 
 

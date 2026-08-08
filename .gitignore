@@ -1,5 +1,10 @@
 .env
 config.json
+cards/*.json
+卡/*/
+!卡/README.md
+!卡/AGENTS.md
+.probe-character-api/
 __pycache__/
 *.pyc
 *.pyo

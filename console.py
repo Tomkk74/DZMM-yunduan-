@@ -20,6 +20,7 @@ from pathlib import Path
 KIT = Path(__file__).resolve().parent
 sys.path.insert(0, str(KIT / "lib"))
 import dzmm_studio as studio  # noqa: E402
+import dzmm_character as character  # noqa: E402
 import pull_container as puller  # noqa: E402
 
 WEB_DIR = KIT / "web"
@@ -124,6 +125,8 @@ def build_status() -> dict:
     project = str(studio.project_root())
     cid = int(cfg.get("character_id") or 0)
     project_path = project if project != str(studio.KIT_ROOT) else (cfg.get("project_path") or "")
+    if project_path:
+        project_path = str(studio.normalize_project_root(project_path))
     return {
         "ok": True,
         "loggedIn": logged_in,
@@ -851,6 +854,379 @@ def do_start_sync(body: dict) -> dict:
     return {"ok": True, "message": "同步已开始", "job": sync_job_snapshot()}
 
 
+def do_card_list() -> dict:
+    try:
+        return {
+            "ok": True,
+            "cardsDir": str(character.cards_root()),
+            "items": character.list_local_cards(),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e), "items": []}
+
+
+def do_card_get(local_id: str) -> dict:
+    try:
+        card = character.load_local(local_id)
+        return {
+            "ok": True,
+            "localId": (card.get("_meta") or {}).get("localId") or local_id,
+            "folder": (card.get("_meta") or {}).get("folder") or "",
+            "mtime": float((card.get("_meta") or {}).get("mtime") or 0),
+            "card": card,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_card_new(body: dict) -> dict:
+    try:
+        name = str(body.get("name") or "未命名角色").strip() or "未命名角色"
+        brief = str(body.get("brief") or "").strip()
+        saved = character.create_local(name, brief=brief)
+        return {
+            "ok": True,
+            "localId": saved["localId"],
+            "path": saved["path"],
+            "folder": saved["path"],
+            "mtime": saved.get("mtime") or 0,
+            "card": saved["card"],
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_card_save(body: dict) -> dict:
+    try:
+        card = body.get("card")
+        local_id = body.get("localId")
+        if not isinstance(card, dict):
+            return {"ok": False, "error": "缺少 card 对象"}
+        # 允许前端只提交 data 字段
+        if "data" not in card and any(k in card for k in ("name", "description", "personality")):
+            base = character.empty_card(str(card.get("name") or "未命名角色"))
+            for k in (
+                "name",
+                "description",
+                "personality",
+                "scenario",
+                "first_mes",
+                "tags",
+                "creator_notes",
+            ):
+                if k in card:
+                    base["data"][k] = card[k]
+            if isinstance(body.get("meta"), dict):
+                base["_meta"].update(body["meta"])
+            card = base
+        brief = str(body.get("brief") or (card.get("_meta") or {}).get("brief") or "")
+        saved = character.save_local(card, local_id=str(local_id or "").strip() or None)
+        # 再写一遍 brief（save_local 已带 meta.brief；这里保证 body.brief 优先生效）
+        if brief:
+            saved = character.write_folder(saved["card"], local_id=saved["localId"], brief=brief)
+        return {
+            "ok": True,
+            "localId": saved["localId"],
+            "path": saved["path"],
+            "folder": saved["path"],
+            "mtime": saved.get("mtime") or 0,
+            "card": saved["card"],
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_card_ai(body: dict) -> dict:
+    """不再调平台 AI：按卡名创建/打开「卡/<名>/」，供本地编辑 txt。"""
+    try:
+        brief = str(body.get("brief") or "").strip()
+        name = str(body.get("name") or "").strip()
+        if not name:
+            # 从简述第一行猜卡名
+            first = (brief.splitlines()[0] if brief else "").strip()
+            name = first[:40] if first else "未命名角色"
+        saved = character.prepare_workspace(name, brief=brief)
+        return {
+            "ok": True,
+            "localId": saved["localId"],
+            "path": saved["path"],
+            "folder": saved["path"],
+            "mtime": saved.get("mtime") or 0,
+            "card": saved["card"],
+            "created": bool(saved.get("created")),
+            "hint": f"请编辑本地文件：{saved['path']}\\*.txt（网页会实时同步）",
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_card_poll(local_id: str, since_mtime: float = 0.0) -> dict:
+    try:
+        data = character.poll_local(local_id, since_mtime=since_mtime)
+        data["ok"] = True
+        return data
+    except Exception as e:
+        return {"ok": False, "error": str(e), "changed": False}
+
+
+def do_card_avatar(body: dict) -> dict:
+    try:
+        local_id = str(body.get("localId") or body.get("name") or "").strip()
+        if not local_id:
+            return {"ok": False, "error": "需要 localId（卡名）"}
+        data_b64 = str(body.get("dataBase64") or body.get("data") or "")
+        if not data_b64:
+            return {"ok": False, "error": "缺少图片 dataBase64"}
+        saved = character.save_local_avatar_b64(
+            local_id,
+            data_b64,
+            filename=str(body.get("filename") or ""),
+            mime=str(body.get("mime") or ""),
+        )
+        return {
+            "ok": True,
+            "localId": saved["localId"],
+            "path": saved["path"],
+            "folder": saved.get("folder") or saved["path"],
+            "mtime": saved.get("mtime") or 0,
+            "rel": saved.get("rel"),
+            "avatarUrl": saved.get("avatarUrl"),
+            "serveUrl": saved.get("serveUrl"),
+            "card": saved["card"],
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_card_image(body: dict) -> dict:
+    try:
+        local_id = str(body.get("localId") or body.get("name") or "").strip()
+        if not local_id:
+            return {"ok": False, "error": "需要 localId（卡名）"}
+        action = str(body.get("action") or "add").strip().lower()
+        if action == "remove":
+            saved = character.remove_local_image(local_id, int(body.get("index")))
+            return {
+                "ok": True,
+                "localId": saved["localId"],
+                "path": saved["path"],
+                "folder": saved.get("folder") or saved["path"],
+                "mtime": saved.get("mtime") or 0,
+                "card": saved["card"],
+            }
+        data_b64 = str(body.get("dataBase64") or body.get("data") or "")
+        if not data_b64:
+            return {"ok": False, "error": "缺少图片 dataBase64"}
+        saved = character.save_local_image(
+            local_id,
+            data_b64=data_b64,
+            filename=str(body.get("filename") or ""),
+            mime=str(body.get("mime") or ""),
+            name=str(body.get("name") or ""),
+            set_avatar=bool(body.get("setAvatar")),
+        )
+        return {
+            "ok": True,
+            "localId": saved["localId"],
+            "path": saved["path"],
+            "folder": saved.get("folder") or saved["path"],
+            "mtime": saved.get("mtime") or 0,
+            "rel": saved.get("rel"),
+            "serveUrl": saved.get("serveUrl"),
+            "index": saved.get("index"),
+            "card": saved["card"],
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_card_voices() -> dict:
+    try:
+        data = character.list_platform_voices()
+        return {"ok": True, **data}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "public": [], "mine": []}
+
+
+def do_card_voice(body: dict) -> dict:
+    try:
+        local_id = str(body.get("localId") or "").strip()
+        if not local_id:
+            return {"ok": False, "error": "需要 localId"}
+        if body.get("clear"):
+            saved = character.set_voice_settings(local_id, None)
+        else:
+            voice = body.get("voice")
+            if not isinstance(voice, dict) or not voice.get("id"):
+                return {"ok": False, "error": "需要 voice 对象（含 id/name）"}
+            saved = character.set_voice_settings(
+                local_id,
+                voice,
+                settings=body.get("settings") if isinstance(body.get("settings"), dict) else None,
+            )
+        return {
+            "ok": True,
+            "localId": saved["localId"],
+            "path": saved["path"],
+            "folder": saved.get("folder") or saved["path"],
+            "mtime": saved.get("mtime") or 0,
+            "card": saved["card"],
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_card_delete_local(body: dict) -> dict:
+    try:
+        local_id = str(body.get("localId") or "").strip()
+        if not local_id:
+            return {"ok": False, "error": "需要 localId"}
+        result = character.delete_local_card(local_id)
+        return {"ok": True, **result}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_card_delete_cloud(body: dict) -> dict:
+    """删云端草稿 / 下线已发布卡（可级联清同卡草稿）。"""
+    try:
+        cloud_id = int(body.get("cloudId") or body.get("id") or 0)
+        if cloud_id <= 0:
+            return {"ok": False, "error": "需要有效 cloudId"}
+        is_draft = body.get("isDraft")
+        if is_draft is not None:
+            is_draft = bool(is_draft)
+        character_id = body.get("characterId") or body.get("dbId")
+        if character_id is not None:
+            try:
+                character_id = int(character_id)
+            except (TypeError, ValueError):
+                character_id = None
+        also_hide = body.get("alsoHidePublished")
+        if also_hide is None:
+            also_hide = True
+        cascade = body.get("cascadeDrafts")
+        if cascade is None:
+            cascade = True
+        result = character.remove_cloud_card(
+            cloud_id=cloud_id,
+            is_draft=is_draft,
+            also_hide_published=bool(also_hide),
+            cascade_drafts=bool(cascade),
+            character_id=character_id,
+        )
+        return {"ok": True, **result}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_card_publish(body: dict) -> dict:
+    try:
+        local_id = str(body.get("localId") or "").strip()
+        if not local_id:
+            return {"ok": False, "error": "需要 localId"}
+        # 若前端带了最新表单，先落盘再发
+        card = body.get("card")
+        if isinstance(card, dict):
+            brief = str(body.get("brief") or (card.get("_meta") or {}).get("brief") or "")
+            character.save_local(card, local_id=local_id)
+            if brief:
+                character.write_folder(
+                    character.load_local(local_id),
+                    local_id=local_id,
+                    brief=brief,
+                )
+        as_draft = bool(body.get("draft") or body.get("asDraft"))
+        saved = character.publish_to_cloud(local_id, as_draft=as_draft)
+        return {
+            "ok": True,
+            "localId": saved["localId"],
+            "path": saved["path"],
+            "folder": saved.get("folder") or saved["path"],
+            "mtime": saved.get("mtime") or 0,
+            "card": saved["card"],
+            "mode": saved.get("mode"),
+            "cloudId": saved.get("cloudId"),
+            "characterUrl": saved.get("characterUrl") or "",
+            "result": saved.get("result"),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_card_shelf(body: dict) -> dict:
+    """广场上架：card.publish。下架请到官网。"""
+    try:
+        card_id = int(
+            body.get("cardId")
+            or body.get("cloudId")
+            or body.get("id")
+            or 0
+        )
+        if card_id <= 0:
+            return {"ok": False, "error": "需要有效 cardId（先「保存到云端」拿到正式卡）"}
+        listed = body.get("listed")
+        if listed is None:
+            action = str(body.get("action") or "publish").strip().lower()
+            listed = action in ("publish", "shelf", "list", "上架")
+        if listed is False or (isinstance(listed, str) and listed.lower() in ("false", "0", "unpublish", "unshelf")):
+            return {"ok": False, "error": "控制台不支持下架，请到官网自行操作"}
+        local_id = str(body.get("localId") or "").strip() or None
+        result = character.shelf_cloud_card(
+            card_id,
+            listed=True,
+            local_id=local_id,
+        )
+        return {"ok": True, **result}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _serve_card_asset(handler: BaseHTTPRequestHandler, local_id: str, rel: str) -> None:
+    try:
+        file_path = character.resolve_card_asset(local_id, rel)
+    except Exception as e:
+        _json(handler, 404, {"ok": False, "error": str(e)})
+        return
+    ctype = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+    raw = file_path.read_bytes()
+    handler.send_response(200)
+    handler.send_header("Content-Type", ctype)
+    handler.send_header("Content-Length", str(len(raw)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(raw)
+
+
+def do_card_cloud_list() -> dict:
+    try:
+        return {"ok": True, "items": character.list_cloud_cards()}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "items": []}
+
+
+def do_card_pull_cloud(body: dict) -> dict:
+    try:
+        cloud_id = int(body.get("cloudId") or 0)
+        if cloud_id <= 0:
+            return {"ok": False, "error": "需要有效 cloudId"}
+        folder_name = str(body.get("name") or body.get("folderName") or "").strip() or None
+        is_draft = body.get("isDraft")
+        if is_draft is not None:
+            is_draft = bool(is_draft)
+        saved = character.pull_cloud_card(cloud_id, folder_name=folder_name, is_draft=is_draft)
+        return {
+            "ok": True,
+            "localId": saved["localId"],
+            "path": saved["path"],
+            "folder": saved.get("folder") or saved["path"],
+            "mtime": saved.get("mtime") or 0,
+            "card": saved["card"],
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def do_start_preview(body: dict) -> dict:
     global _PREVIEW_PROC
     status = build_status()
@@ -878,12 +1254,15 @@ def do_start_preview(body: dict) -> dict:
 
     if not project:
         project = str(puller.default_out_dir(cid))
-    project_path = Path(project).expanduser().resolve()
+    project_path = studio.normalize_project_root(project)
     index = project_path / "publish" / "index.html"
     if not index.is_file():
         return {
             "ok": False,
-            "error": f"本地没有 publish/index.html，请先拉取容器到正确项目目录：{project_path}",
+            "error": (
+                f"本地没有 publish/index.html。请填「游戏项目根目录」"
+                f"（内含 publish/），不要只填到 publish 子目录：{project_path}"
+            ),
             "status": status,
         }
 
@@ -1026,6 +1405,39 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/bridge/publish":
             _json(self, 200, do_bridge_publish_status())
             return
+        if path == "/api/card/list":
+            _json(self, 200, do_card_list())
+            return
+        if path == "/api/card/get":
+            qs = urllib.parse.parse_qs(parsed.query or "")
+            local_id = (qs.get("id") or [""])[0]
+            result = do_card_get(local_id)
+            _json(self, 200 if result.get("ok") else 404, result)
+            return
+        if path == "/api/card/cloud":
+            result = do_card_cloud_list()
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/card/poll":
+            qs = urllib.parse.parse_qs(parsed.query or "")
+            local_id = (qs.get("id") or [""])[0]
+            try:
+                since = float((qs.get("since") or ["0"])[0] or 0)
+            except Exception:
+                since = 0.0
+            result = do_card_poll(local_id, since_mtime=since)
+            _json(self, 200 if result.get("ok") else 404, result)
+            return
+        if path == "/api/card/asset":
+            qs = urllib.parse.parse_qs(parsed.query or "")
+            local_id = (qs.get("id") or [""])[0]
+            rel = (qs.get("path") or [""])[0]
+            _serve_card_asset(self, local_id, rel)
+            return
+        if path == "/api/card/voices":
+            result = do_card_voices()
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
         self._serve_static(path)
 
     def do_POST(self):
@@ -1068,6 +1480,50 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/sync":
             result = do_start_sync(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/card/new":
+            result = do_card_new(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/card/save":
+            result = do_card_save(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/card/ai":
+            result = do_card_ai(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/card/pull":
+            result = do_card_pull_cloud(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/card/avatar":
+            result = do_card_avatar(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/card/image":
+            result = do_card_image(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/card/voice":
+            result = do_card_voice(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/card/publish":
+            result = do_card_publish(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/card/shelf":
+            result = do_card_shelf(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/card/delete":
+            result = do_card_delete_local(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/card/cloud/delete":
+            result = do_card_delete_cloud(body)
             _json(self, 200 if result.get("ok") else 400, result)
             return
         _json(self, 404, {"ok": False, "error": "not found"})
