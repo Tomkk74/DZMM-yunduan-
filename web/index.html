@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DZMM 本地开发控制台</title>
+  <link rel="stylesheet" href="./app.css">
+</head>
+<body>
+  <div class="app" id="appShell">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div>
+          <p class="eyebrow">LOCAL BRIDGE</p>
+          <h1>DZMM 控制台</h1>
+        </div>
+        <div class="brand-right">
+          <div id="lamp" class="lamp off" title="登录状态">未登录</div>
+          <button type="button" class="btn icon" id="sidebarCollapseBtn" title="收起侧栏，游戏全屏">收起</button>
+        </div>
+      </div>
+
+      <nav class="menu" aria-label="功能菜单">
+        <button type="button" class="menu-item active" data-panel="bridge">云端桥接</button>
+        <button type="button" class="menu-item" data-panel="login">账号登录</button>
+        <button type="button" class="menu-item" data-panel="project">项目配置</button>
+        <button type="button" class="menu-item" data-panel="pull">拉取容器</button>
+        <button type="button" class="menu-item" data-panel="status">运行状态</button>
+      </nav>
+
+      <div class="sidebar-scroll">
+        <section class="panel active" id="panel-bridge" data-panel="bridge">
+          <h2>云端桥接</h2>
+          <div id="bridgeCard" class="bridge-card off">
+            <p class="bridge-head"><span id="bridgeLamp" class="dot"></span><span id="bridgeHeadText">预览未启动</span></p>
+            <p class="kv"><b>项目</b> <span id="bridgeProject">—</span></p>
+            <p class="kv"><b>容器 ID</b> <span id="bridgeContainer">—</span></p>
+            <p class="kv"><b>监听端口</b> <span id="bridgePort">—</span></p>
+            <div class="bridge-block">
+              <p class="kv"><b>链接用户</b> <span id="bridgeUser">—</span></p>
+              <p id="bridgeServices" class="bridge-services">—</p>
+              <p id="bridgeRemain" class="bridge-remain">—</p>
+            </div>
+          </div>
+          <div class="actions" style="margin-top:12px">
+            <button type="button" class="btn accent" id="publishBtn">发布到线上</button>
+            <button type="button" class="btn" id="bridgeRefreshBtn">刷新状态</button>
+          </div>
+          <p id="publishMsg" class="hint" style="margin-top:10px">发布会把容器内容正式上线，请确认后再点。</p>
+          <div class="progress-wrap" id="publishBarWrap" hidden>
+            <div id="publishBar" class="progress-bar" style="width:0%"></div>
+          </div>
+        </section>
+
+        <section class="panel" id="panel-login" data-panel="login" hidden>
+          <h2>账号登录</h2>
+          <form id="loginForm" class="form" autocomplete="on">
+            <label>
+              <span>邮箱</span>
+              <input id="email" name="email" type="email" required placeholder="you@example.com">
+            </label>
+            <label>
+              <span>密码</span>
+              <input id="password" name="password" type="password" required placeholder="DZMM 账号密码">
+            </label>
+            <label class="check">
+              <input id="savePassword" type="checkbox" checked>
+              <span>保存密码到本机 .env</span>
+            </label>
+            <div class="actions">
+              <button type="submit" class="btn accent" id="loginBtn">登录</button>
+              <button type="button" class="btn" id="logoutBtn">退出</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel" id="panel-project" data-panel="project" hidden>
+          <h2>项目配置</h2>
+          <form id="configForm" class="form">
+            <label>
+              <span>character_id</span>
+              <input id="characterId" name="characterId" type="number" min="1" placeholder="例如 3355944">
+            </label>
+            <label>
+              <span>本地项目路径</span>
+              <input id="projectPath" name="projectPath" type="text" placeholder="D:\path\to\your-game">
+            </label>
+            <label>
+              <span>预览端口</span>
+              <input id="previewPort" name="previewPort" type="number" min="1024" max="65535" value="8791">
+            </label>
+            <div class="actions">
+              <button type="submit" class="btn">保存配置</button>
+              <button type="button" class="btn accent" id="pingBtn">连接编辑器</button>
+              <a class="btn" id="workbenchLink" href="#" target="_blank" rel="noopener">Workbench</a>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel" id="panel-pull" data-panel="pull" hidden>
+          <h2>拉取容器</h2>
+          <p class="hint">下载云端完整项目到本地路径。空路径默认 <code>../{character_id}</code>。</p>
+          <div class="actions">
+            <button type="button" class="btn accent" id="pullBtn">开始拉取</button>
+            <button type="button" class="btn" id="pullRetryBtn" hidden>重拉失败文件</button>
+          </div>
+          <p id="pullRetryHint" class="hint" hidden>仅重新下载上次失败的文件，不会全量重拉。</p>
+          <div class="progress-wrap">
+            <div id="pullBar" class="progress-bar" style="width:0%"></div>
+          </div>
+          <pre id="pullLog" class="status pull-log">尚未开始</pre>
+        </section>
+
+        <section class="panel" id="panel-status" data-panel="status" hidden>
+          <h2>运行状态</h2>
+          <pre id="statusBox" class="status">加载中…</pre>
+          <p class="hint foot-note">账号只存本机 <code>.env</code>，勿分享。</p>
+        </section>
+      </div>
+
+      <div class="sidebar-foot">
+        <p id="msg" class="msg" hidden></p>
+      </div>
+    </aside>
+
+    <main class="stage">
+      <header class="stage-bar">
+        <div class="stage-title">
+          <strong>本地预览</strong>
+          <span id="previewMeta" class="stage-meta">预览未启动</span>
+        </div>
+        <div class="actions stage-actions">
+          <button type="button" class="btn accent" id="previewStartBtn">启动预览</button>
+          <button type="button" class="btn" id="previewReloadBtn" title="只刷新中间预览，不刷新控制台">刷新预览</button>
+          <button type="button" class="btn" id="previewStopBtn">停止</button>
+          <a class="btn" id="previewLink" href="#" target="_blank" rel="noopener">新窗口</a>
+          <button type="button" class="btn" id="sidebarCollapseBtn2" title="收起侧栏">全屏</button>
+        </div>
+      </header>
+      <div class="stage-frame">
+        <iframe id="previewFrame" title="本地游戏预览" src="about:blank"></iframe>
+        <div id="previewEmpty" class="stage-empty">
+          <p>中间为大屏预览区</p>
+          <p>左侧登录并配置项目后，点「启动预览」</p>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- 侧栏收起后：悬浮发布键 + 展开菜单 -->
+  <div id="fabDock" class="fab-dock" hidden>
+    <button type="button" class="fab-expand" id="fabExpand" title="按住拖动位置；单击展开菜单">菜单</button>
+    <button type="button" class="fab-expand" id="fabReload" title="只刷新中间预览">刷新</button>
+    <button type="button" class="fab-publish" id="fabPublish" title="直接发布到线上">
+      <svg class="fab-ring" viewBox="0 0 48 48" aria-hidden="true">
+        <circle class="fab-track" cx="24" cy="24" r="20"></circle>
+        <circle class="fab-prog" id="fabProg" cx="24" cy="24" r="20"></circle>
+      </svg>
+      <span class="fab-label" id="fabLabel">发布</span>
+    </button>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>
