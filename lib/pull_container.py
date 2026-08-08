@@ -204,6 +204,12 @@ def pull_paths(
     }
     write_pull_meta(out_dir, meta)
     s.save_config({"character_id": character_id, "project_path": str(out_dir)})
+    # 拉取完成后建立增量 sync 基线，避免下次误传全量
+    try:
+        s.refresh_root()
+        s.write_sync_baseline()
+    except Exception:
+        pass
 
     summary = {
         "ok": fail == 0,

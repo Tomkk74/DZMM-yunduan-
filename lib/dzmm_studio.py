@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import mimetypes
 import sys
@@ -143,10 +144,12 @@ SYNC_GLOBS = [
 
 SYNC_SKIP_REL = {
     "_pull_meta.json",
+    "_sync_meta.json",
     "本地开发说明.md",
 }
 
 SKIP_PARTS = {".git", "node_modules", "__pycache__", "tools", ".cursor"}
+SYNC_META_NAME = "_sync_meta.json"
 
 
 def _read_env_map() -> dict[str, str]:
@@ -406,6 +409,117 @@ def list_local_files() -> list[Path]:
     return sorted(set(files), key=lambda p: p.as_posix())
 
 
+def sync_meta_path() -> Path:
+    refresh_root()
+    return ROOT / SYNC_META_NAME
+
+
+def _file_sig(path: Path) -> dict:
+    st = path.stat()
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)))
+    return {
+        "size": int(st.st_size),
+        "mtime_ns": mtime_ns,
+        "sha256": h.hexdigest(),
+    }
+
+
+def load_sync_meta() -> dict:
+    path = sync_meta_path()
+    if not path.is_file():
+        return {"version": 1, "files": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("files"), dict):
+            data.setdefault("version", 1)
+            return data
+    except Exception:
+        pass
+    return {"version": 1, "files": {}}
+
+
+def save_sync_meta(meta: dict) -> None:
+    path = sync_meta_path()
+    out = {
+        "version": 1,
+        "character_id": int(meta.get("character_id") or DEFAULT_CARD_ID or 0),
+        "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "files": meta.get("files") if isinstance(meta.get("files"), dict) else {},
+    }
+    path.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def write_sync_baseline(files: list[Path] | None = None) -> dict:
+    """把当前本地文件记为已同步基线（不上传）。拉取完成后应调用。"""
+    refresh_root()
+    files = list(files) if files is not None else list_local_files()
+    entries: dict = {}
+    for path in files:
+        rel = path.relative_to(ROOT).as_posix()
+        try:
+            entries[rel] = _file_sig(path)
+        except Exception:
+            continue
+    meta = {
+        "version": 1,
+        "character_id": DEFAULT_CARD_ID,
+        "files": entries,
+    }
+    save_sync_meta(meta)
+    return meta
+
+
+def select_files_to_sync(files: list[Path], *, full: bool = False) -> tuple[list[Path], dict, str]:
+    """选出需要上传的文件。
+
+    - full=True：全部上传
+    - 无基线：先写基线并返回空列表（假定刚拉取后本地=容器）
+    - 有基线：只返回 size/mtime/sha256 变化的文件
+    """
+    refresh_root()
+    files = list(files)
+    meta = load_sync_meta()
+    prev = dict(meta.get("files") or {})
+    if full:
+        return files, meta, "full"
+    if not prev:
+        write_sync_baseline(files)
+        return [], load_sync_meta(), "baseline"
+    changed: list[Path] = []
+    for path in files:
+        rel = path.relative_to(ROOT).as_posix()
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        old = prev.get(rel)
+        mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)))
+        if (
+            old
+            and int(old.get("size") or -1) == int(st.st_size)
+            and int(old.get("mtime_ns") or -1) == mtime_ns
+        ):
+            continue
+        try:
+            sig = _file_sig(path)
+        except Exception:
+            changed.append(path)
+            continue
+        if old and old.get("sha256") and old.get("sha256") == sig["sha256"]:
+            prev[rel] = sig
+            continue
+        changed.append(path)
+    meta["files"] = prev
+    return changed, meta, "incremental"
+
+
 def to_container_path(path: Path) -> str:
     rel = path.relative_to(ROOT).as_posix()
     return "/" + rel
@@ -497,18 +611,32 @@ def cmd_sync(args):
     if args.only:
         only = {p.replace("\\", "/") for p in args.only}
         files = [f for f in files if f.relative_to(ROOT).as_posix() in only]
-    print(f"sync {len(files)} files -> container gameId={game_id}")
+    full = bool(getattr(args, "full", False))
+    to_upload, meta, mode = select_files_to_sync(files, full=full)
+    if mode == "baseline":
+        print(f"sync: 已建立增量基线（{len((meta.get('files') or {}))} 个文件），本次不上传")
+        print("提示：之后只传有改动的文件；若需全量请加 --full")
+        return
+    if not to_upload:
+        print("sync: 无变更文件，跳过上传")
+        return
+    print(f"sync {len(to_upload)}/{len(files)} changed -> container gameId={game_id} ({mode})")
     ok = fail = 0
-    for i, path in enumerate(files, 1):
+    entries = dict(meta.get("files") or {})
+    for i, path in enumerate(to_upload, 1):
         rel = path.relative_to(ROOT).as_posix()
         try:
             upload_file(cookie, token, game_id, path)
+            entries[rel] = _file_sig(path)
             ok += 1
-            if args.verbose or i % 25 == 0 or i == len(files):
-                print(f"  [{i}/{len(files)}] {rel}")
+            if args.verbose or i % 25 == 0 or i == len(to_upload):
+                print(f"  [{i}/{len(to_upload)}] {rel}")
         except Exception as e:
             fail += 1
             print(f"  FAIL {rel}: {e}")
+    meta["files"] = entries
+    meta["character_id"] = int(getattr(args, "character_id", 0) or DEFAULT_CARD_ID or 0)
+    save_sync_meta(meta)
     print(f"uploaded ok={ok} fail={fail}")
     if fail:
         raise SystemExit(1)
@@ -597,10 +725,11 @@ def main():
     add_common(s)
     s.set_defaults(func=cmd_status)
 
-    s = sub.add_parser("sync", help="把本地 publish/functions/docs 同步到线上容器并 git save")
+    s = sub.add_parser("sync", help="增量同步本地改动到线上容器并 git save（默认只传变更）")
     add_common(s)
     s.add_argument("--message", default="sync from local")
     s.add_argument("--no-git-save", action="store_true")
+    s.add_argument("--full", action="store_true", help="强制全量上传（忽略增量基线）")
     s.add_argument("--only", nargs="*", help="只同步指定相对路径")
     s.add_argument("-v", "--verbose", action="store_true")
     s.set_defaults(func=cmd_sync)

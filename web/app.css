@@ -460,17 +460,40 @@ input:focus {
   display: none;
 }
 
-/* —— 收起后悬浮发布 —— */
+/* —— 收起后：中心发布 + 环绕卫星键 —— */
 .fab-dock {
   position: fixed;
   z-index: 100000;
   left: 16px;
   bottom: 18px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 8px;
+  width: 168px;
+  height: 168px;
+  display: grid;
+  place-items: center;
   touch-action: none;
+  pointer-events: none; /* 仅子元素可点，避免挡预览 */
+}
+
+.fab-toast {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 6px);
+  transform: translateX(-50%);
+  z-index: 3;
+  max-width: 220px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgb(10 10 10 / 90%);
+  color: #fff;
+  font: 600 12px/1.35 var(--font);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 8px 20px rgb(0 0 0 / 35%);
+}
+
+.fab-toast.is-err {
+  background: rgb(92 34 31 / 94%);
 }
 
 .fab-dock[hidden] {
@@ -481,46 +504,113 @@ input:focus {
   opacity: 0.92;
 }
 
-.fab-expand {
+.fab-orbit {
+  /* 与 dock 同大，保证环绕空隙仍可悬停，不会点穿到预览导致收起 */
+  position: relative;
+  width: 168px;
+  height: 168px;
+  pointer-events: auto;
+}
+
+/* 卫星：默认收拢到中心，悬停/展开时飞到环绕位 */
+.fab-sat {
   appearance: none;
-  min-width: 52px;
-  min-height: 28px;
-  padding: 0 10px;
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 1;
+  width: 46px;
+  height: 46px;
+  margin: 0;
+  padding: 0;
   border: 2px solid #fff;
-  background: rgb(10 10 10 / 82%);
+  border-radius: 50%;
+  background: rgb(10 10 10 / 88%);
   color: #fff;
   font: 700 11px/1 var(--font);
-  cursor: grab;
-  box-shadow: 0 6px 18px rgb(0 0 0 / 35%);
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  box-shadow: 0 8px 20px rgb(0 0 0 / 38%);
   user-select: none;
-  touch-action: none;
+  transform: translate(-50%, -50%) scale(0.28);
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    transform 0.48s cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 0.42s ease,
+    background 0.2s ease,
+    box-shadow 0.2s ease;
 }
 
-.fab-expand:hover {
+.fab-sat:hover {
   background: #000;
+  box-shadow: 0 0 0 3px rgb(255 255 255 / 28%), 0 10px 24px rgb(0 0 0 / 45%);
 }
 
-.fab-expand:active,
-.fab-dock.is-dragging .fab-expand {
-  cursor: grabbing;
+.fab-sat:disabled {
+  opacity: 0.45;
+  cursor: wait;
+}
+
+.fab-dock.is-open .fab-sat,
+.fab-dock:hover .fab-sat {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* 上：刷新 · 左下：菜单 · 右下：同步 */
+.fab-dock.is-open .fab-sat[data-slot="reload"],
+.fab-dock:hover .fab-sat[data-slot="reload"] {
+  transform: translate(-50%, calc(-50% - 62px)) scale(1);
+}
+
+.fab-dock.is-open .fab-sat[data-slot="menu"],
+.fab-dock:hover .fab-sat[data-slot="menu"] {
+  transform: translate(calc(-50% - 54px), calc(-50% + 36px)) scale(1);
+}
+
+.fab-dock.is-open .fab-sat[data-slot="sync"],
+.fab-dock:hover .fab-sat[data-slot="sync"] {
+  transform: translate(calc(-50% + 54px), calc(-50% + 36px)) scale(1);
+}
+
+.fab-sat[data-slot="sync"].is-run {
+  background: #1a2740;
+}
+
+.fab-sat[data-slot="sync"].is-ok {
+  background: #1f4030;
+}
+
+.fab-sat[data-slot="sync"].is-err {
+  background: #5c221f;
 }
 
 .fab-publish {
   appearance: none;
-  position: relative;
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 2;
   width: 72px;
   height: 72px;
   border: 0;
   border-radius: 50%;
   background: #0a0a0a;
   color: #fff;
-  cursor: pointer;
-  box-shadow: 0 10px 28px rgb(0 0 0 / 40%);
+  cursor: grab;
+  box-shadow: 0 10px 28px rgb(0 0 0 / 40%), 0 0 0 2px rgb(255 255 255 / 18%);
   padding: 0;
+  transform: translate(-50%, -50%);
+  touch-action: none;
 }
 
 .fab-publish:hover {
   background: #1a1a1a;
+}
+
+.fab-dock.is-dragging .fab-publish {
+  cursor: grabbing;
 }
 
 .fab-publish:disabled {
@@ -542,6 +632,7 @@ input:focus {
   width: 100%;
   height: 100%;
   transform: rotate(-90deg); /* 12 点方向起，顺时针 */
+  pointer-events: none;
 }
 
 .fab-track,
@@ -567,6 +658,7 @@ input:focus {
   z-index: 1;
   font: 800 13px/1 var(--font);
   letter-spacing: 0.08em;
+  pointer-events: none;
 }
 
 @media (max-width: 960px) {

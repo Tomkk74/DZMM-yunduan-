@@ -54,6 +54,21 @@ _PREVIEW_META: dict = {
     "message": "",
 }
 
+_SYNC_LOCK = threading.Lock()
+_SYNC_JOB: dict = {
+    "running": False,
+    "phase": "",
+    "message": "",
+    "current": 0,
+    "total": 0,
+    "ok": 0,
+    "fail": 0,
+    "error": "",
+    "done": False,
+    "fails": [],
+    "gameId": "",
+}
+
 
 def _json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
     raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -356,23 +371,27 @@ def do_start_pull(body: dict) -> dict:
 
     with _PULL_LOCK:
         if _PULL_JOB.get("running"):
-            return {"ok": False, "error": "已有拉取任务进行中", "job": pull_job_snapshot()}
-        _PULL_JOB.update({
-            "running": True,
-            "phase": "start",
-            "message": "开始拉取容器…",
-            "current": 0,
-            "total": 0,
-            "ok": 0,
-            "fail": 0,
-            "failedPaths": [],
-            "mode": "full",
-            "out": out or str(puller.default_out_dir(cid)),
-            "error": "",
-            "done": False,
-            "result": None,
-            "logs": ["开始拉取容器完整项目…"],
-        })
+            pull_busy = True
+        else:
+            pull_busy = False
+            _PULL_JOB.update({
+                "running": True,
+                "phase": "start",
+                "message": "开始拉取容器…",
+                "current": 0,
+                "total": 0,
+                "ok": 0,
+                "fail": 0,
+                "failedPaths": [],
+                "mode": "full",
+                "out": out or str(puller.default_out_dir(cid)),
+                "error": "",
+                "done": False,
+                "result": None,
+                "logs": ["开始拉取容器完整项目…"],
+            })
+    if pull_busy:
+        return {"ok": False, "error": "已有拉取任务进行中", "job": pull_job_snapshot(), "status": status}
 
     thread = threading.Thread(
         target=_run_pull_job,
@@ -418,23 +437,27 @@ def do_retry_failed_pull(body: dict) -> dict:
 
     with _PULL_LOCK:
         if _PULL_JOB.get("running"):
-            return {"ok": False, "error": "已有拉取任务进行中", "job": pull_job_snapshot()}
-        _PULL_JOB.update({
-            "running": True,
-            "phase": "start",
-            "message": f"重试失败文件 {len(failed_paths)} 个…",
-            "current": 0,
-            "total": len(failed_paths),
-            "ok": 0,
-            "fail": 0,
-            "failedPaths": list(failed_paths),
-            "mode": "retry",
-            "out": out,
-            "error": "",
-            "done": False,
-            "result": None,
-            "logs": [f"只重拉失败文件（{len(failed_paths)}）…"],
-        })
+            pull_busy = True
+        else:
+            pull_busy = False
+            _PULL_JOB.update({
+                "running": True,
+                "phase": "start",
+                "message": f"重试失败文件 {len(failed_paths)} 个…",
+                "current": 0,
+                "total": len(failed_paths),
+                "ok": 0,
+                "fail": 0,
+                "failedPaths": list(failed_paths),
+                "mode": "retry",
+                "out": out,
+                "error": "",
+                "done": False,
+                "result": None,
+                "logs": [f"只重拉失败文件（{len(failed_paths)}）…"],
+            })
+    if pull_busy:
+        return {"ok": False, "error": "已有拉取任务进行中", "job": pull_job_snapshot(), "status": status}
 
     thread = threading.Thread(
         target=_run_retry_failed_job,
@@ -637,6 +660,197 @@ def do_bridge_publish_status() -> dict:
         return {"ok": False, "error": str(e), "preview": preview}
 
 
+def sync_job_snapshot() -> dict:
+    with _SYNC_LOCK:
+        return {
+            "running": bool(_SYNC_JOB.get("running")),
+            "phase": _SYNC_JOB.get("phase") or "",
+            "message": _SYNC_JOB.get("message") or "",
+            "current": int(_SYNC_JOB.get("current") or 0),
+            "total": int(_SYNC_JOB.get("total") or 0),
+            "okCount": int(_SYNC_JOB.get("ok") or 0),
+            "failCount": int(_SYNC_JOB.get("fail") or 0),
+            "error": _SYNC_JOB.get("error") or "",
+            "done": bool(_SYNC_JOB.get("done")),
+            "fails": list(_SYNC_JOB.get("fails") or []),
+            "gameId": _SYNC_JOB.get("gameId") or "",
+        }
+
+
+def _sync_set(**kwargs) -> None:
+    with _SYNC_LOCK:
+        _SYNC_JOB.update(kwargs)
+
+
+def _run_sync_job(cid: int, message: str, only, full: bool = False) -> None:
+    try:
+        _sync_set(phase="scan", message="扫描变更…", current=0, total=0, ok=0, fail=0, error="", fails=[])
+        studio.refresh_root()
+        cookie, token, remain, email = studio.load_auth()
+        _, game_id = studio.ensure_editor(cookie, token, cid)
+        _sync_set(gameId=str(game_id or ""), phase="auth", message="连接编辑器…")
+
+        files = studio.list_local_files()
+        if isinstance(only, list) and only:
+            only_set = {str(p).replace("\\", "/") for p in only}
+            files = [f for f in files if f.relative_to(studio.ROOT).as_posix() in only_set]
+        if not files:
+            _sync_set(
+                running=False,
+                done=True,
+                phase="error",
+                error="没有可同步的文件（检查本地项目路径是否含 publish/）",
+                message="同步失败",
+            )
+            return
+
+        to_upload, meta, mode = studio.select_files_to_sync(files, full=bool(full))
+        if mode == "baseline":
+            _sync_set(
+                running=False,
+                done=True,
+                phase="done",
+                message=f"已建立增量基线（{len(meta.get('files') or {})} 个），无文件需上传",
+                ok=0,
+                fail=0,
+                error="",
+                current=0,
+                total=0,
+            )
+            return
+        if not to_upload:
+            _sync_set(
+                running=False,
+                done=True,
+                phase="done",
+                message="无变更文件，已跳过",
+                ok=0,
+                fail=0,
+                error="",
+                current=0,
+                total=0,
+            )
+            return
+
+        total = len(to_upload)
+        _sync_set(
+            phase="upload",
+            message=f"增量上传 0/{total}（共扫描 {len(files)}）",
+            current=0,
+            total=total,
+        )
+        ok = fail = 0
+        fails: list[str] = []
+        entries = dict(meta.get("files") or {})
+        for i, path in enumerate(to_upload, start=1):
+            rel = path.relative_to(studio.ROOT).as_posix()
+            try:
+                studio.upload_file(cookie, token, game_id, path)
+                entries[rel] = studio._file_sig(path)
+                ok += 1
+            except Exception as e:
+                fail += 1
+                if len(fails) < 8:
+                    fails.append(f"{rel}: {e}")
+            _sync_set(
+                current=i,
+                ok=ok,
+                fail=fail,
+                fails=list(fails),
+                message=f"增量上传 {i}/{total}" + (f"（失败 {fail}）" if fail else ""),
+            )
+
+        meta["files"] = entries
+        meta["character_id"] = cid
+        studio.save_sync_meta(meta)
+
+        if fail:
+            _sync_set(
+                running=False,
+                done=True,
+                phase="error",
+                error=f"部分失败：成功 {ok}，失败 {fail}",
+                message=f"同步结束：成功 {ok}，失败 {fail}",
+                ok=ok,
+                fail=fail,
+                fails=fails,
+            )
+            return
+
+        _sync_set(phase="git", message="保存容器 git…")
+        studio.git_save(cookie, token, game_id, message)
+        _sync_set(
+            running=False,
+            done=True,
+            phase="done",
+            message=f"已增量同步 {ok} 个文件并保存",
+            ok=ok,
+            fail=0,
+            error="",
+        )
+    except SystemExit as e:
+        _sync_set(running=False, done=True, phase="error", error=str(e), message=f"同步失败：{e}")
+    except Exception as e:
+        _sync_set(running=False, done=True, phase="error", error=str(e), message=f"同步失败：{e}")
+
+
+def do_start_sync(body: dict) -> dict:
+    """Start background incremental sync to Workbench + git save."""
+    status = build_status()
+    if not status.get("loggedIn"):
+        return {"ok": False, "error": "尚未登录", "job": sync_job_snapshot()}
+
+    cid = body.get("characterId")
+    if cid is None or str(cid).strip() == "":
+        cid = status.get("characterId")
+    try:
+        cid = int(cid or 0)
+    except Exception:
+        cid = 0
+    if not cid:
+        return {"ok": False, "error": "缺少 character_id", "job": sync_job_snapshot()}
+
+    project = str(body.get("projectPath") or status.get("projectPath") or "").strip()
+    if project:
+        studio.save_config({"character_id": cid, "project_path": project})
+    else:
+        studio.save_config({"character_id": cid})
+
+    message = str((body or {}).get("message") or "sync from local console").strip() or "sync from local console"
+    only = (body or {}).get("only")
+    full = bool((body or {}).get("full"))
+
+    with _SYNC_LOCK:
+        if _SYNC_JOB.get("running"):
+            busy = True
+        else:
+            busy = False
+            _SYNC_JOB.update({
+                "running": True,
+                "phase": "start",
+                "message": "正在启动同步…",
+                "current": 0,
+                "total": 0,
+                "ok": 0,
+                "fail": 0,
+                "error": "",
+                "done": False,
+                "fails": [],
+                "gameId": "",
+            })
+    if busy:
+        return {"ok": False, "error": "已有同步任务进行中", "job": sync_job_snapshot()}
+
+    thread = threading.Thread(
+        target=_run_sync_job,
+        args=(cid, message, only, full),
+        name="dzmm-sync",
+        daemon=True,
+    )
+    thread.start()
+    return {"ok": True, "message": "同步已开始", "job": sync_job_snapshot()}
+
+
 def do_start_preview(body: dict) -> dict:
     global _PREVIEW_PROC
     status = build_status()
@@ -790,6 +1004,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/status":
             payload = build_status()
             payload["pull"] = pull_job_snapshot()
+            payload["sync"] = sync_job_snapshot()
             payload["preview"] = preview_snapshot()
             _json(self, 200, payload)
             return
@@ -798,6 +1013,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/pull":
             _json(self, 200, {"ok": True, "job": pull_job_snapshot()})
+            return
+        if path == "/api/sync":
+            _json(self, 200, {"ok": True, "job": sync_job_snapshot()})
             return
         if path == "/api/preview":
             _json(self, 200, {"ok": True, "preview": preview_snapshot()})
@@ -846,6 +1064,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/bridge/publish":
             result = do_bridge_publish(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/sync":
+            result = do_start_sync(body)
             _json(self, 200 if result.get("ok") else 400, result)
             return
         _json(self, 404, {"ok": False, "error": "not found"})

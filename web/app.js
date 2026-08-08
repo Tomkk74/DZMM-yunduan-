@@ -25,12 +25,27 @@
     el.hidden = !text;
     el.textContent = text || '';
     el.className = 'msg ' + (ok ? 'ok' : 'err');
+    var toast = $('fabToast');
+    if (toast) {
+      var dock = $('fabDock');
+      var showToast = !!(text && dock && !dock.hidden);
+      toast.hidden = !showToast;
+      toast.textContent = text || '';
+      toast.className = 'fab-toast' + (ok ? '' : ' is-err');
+    }
   }
 
-  function setBusy(busy) {
-    ['loginBtn', 'logoutBtn', 'pingBtn', 'pullBtn', 'pullRetryBtn', 'previewStartBtn', 'previewStopBtn', 'previewReloadBtn', 'publishBtn', 'bridgeRefreshBtn', 'fabPublish', 'fabReload'].forEach(function (id) {
+  function setBusy(busy, opts) {
+    opts = opts || {};
+    var keep = opts.keepEnabled || {};
+    ['loginBtn', 'logoutBtn', 'pingBtn', 'pullBtn', 'pullRetryBtn', 'previewStartBtn', 'previewStopBtn', 'previewReloadBtn', 'publishBtn', 'bridgeRefreshBtn', 'fabPublish', 'fabReload', 'fabSync', 'fabExpand'].forEach(function (id) {
       var el = $(id);
-      if (el) el.disabled = !!busy;
+      if (!el) return;
+      if (busy && keep[id]) {
+        el.disabled = false;
+        return;
+      }
+      el.disabled = !!busy;
     });
   }
 
@@ -575,10 +590,6 @@
     runPublish({ direct: false });
   });
 
-  $('fabPublish').addEventListener('click', function () {
-    runPublish({ direct: true });
-  });
-
   function bindCollapse(id) {
     var el = $(id);
     if (!el) return;
@@ -594,8 +605,8 @@
     if (!dock) return;
     var pad = 8;
     var rect = dock.getBoundingClientRect();
-    var w = rect.width || 80;
-    var h = rect.height || 120;
+    var w = rect.width || 168;
+    var h = rect.height || 168;
     var maxL = Math.max(pad, window.innerWidth - w - pad);
     var maxT = Math.max(pad, window.innerHeight - h - pad);
     var l = Math.min(maxL, Math.max(pad, left));
@@ -618,9 +629,36 @@
     } catch (_) {}
   }
 
+  function bindFabHover() {
+    var dock = $('fabDock');
+    if (!dock) return;
+    var leaveTimer = null;
+    function openFab() {
+      if (leaveTimer) {
+        clearTimeout(leaveTimer);
+        leaveTimer = null;
+      }
+      dock.classList.add('is-open');
+    }
+    function scheduleClose() {
+      if (leaveTimer) clearTimeout(leaveTimer);
+      // 稍延迟再收起，方便鼠标滑到卫星键
+      leaveTimer = setTimeout(function () {
+        dock.classList.remove('is-open');
+        leaveTimer = null;
+      }, 160);
+    }
+    dock.addEventListener('pointerenter', openFab);
+    dock.addEventListener('pointerleave', scheduleClose);
+    // 触屏：点中心附近也可保持展开一会儿
+    dock.addEventListener('pointerdown', function () {
+      openFab();
+    });
+  }
+
   function bindFabDrag() {
     var dock = $('fabDock');
-    var handle = $('fabExpand');
+    var handle = $('fabPublish');
     if (!dock || !handle) return;
 
     var dragging = false;
@@ -684,10 +722,11 @@
         moved = false;
         return;
       }
-      setSidebarCollapsed(false);
+      runPublish({ direct: true });
     });
   }
 
+  bindFabHover();
   bindFabDrag();
   // 展开侧栏时不必清位置；下次收起继续用
   var _setCollapsed = setSidebarCollapsed;
@@ -703,10 +742,113 @@
     reloadPreviewOnly();
   });
 
+  var fabExpand = $('fabExpand');
+  if (fabExpand) {
+    fabExpand.addEventListener('click', function () {
+      setSidebarCollapsed(false);
+    });
+  }
+
   var fabReload = $('fabReload');
   if (fabReload) {
     fabReload.addEventListener('click', function () {
       reloadPreviewOnly();
+    });
+  }
+
+  function setFabSyncState(mode, text) {
+    var btn = $('fabSync');
+    if (!btn) return;
+    btn.classList.remove('is-run', 'is-ok', 'is-err');
+    if (mode) btn.classList.add('is-' + mode);
+    if (text) btn.textContent = text;
+    else if (mode === 'run') btn.textContent = '…';
+    else if (mode === 'ok') btn.textContent = '完成';
+    else if (mode === 'err') btn.textContent = '失败';
+    else btn.textContent = '同步';
+  }
+
+  var syncTimer = null;
+
+  function stopSyncPoll() {
+    if (syncTimer) {
+      clearInterval(syncTimer);
+      syncTimer = null;
+    }
+  }
+
+  function applySyncJob(job) {
+    if (!job) return;
+    if (job.running) {
+      var short = job.total ? (job.current + '/' + job.total) : '…';
+      setFabSyncState('run', short.length > 6 ? '…' : short);
+      var prog = job.total
+        ? ('同步 ' + job.current + '/' + job.total)
+        : (job.message || '同步中…');
+      showMsg(prog, true);
+      return;
+    }
+    if (job.done) {
+      stopSyncPoll();
+      setBusy(false);
+      if (job.error || job.failCount) {
+        setFabSyncState('err', '失败');
+        showMsg(job.error || job.message || '同步失败', false);
+        setTimeout(function () { setFabSyncState('', '同步'); }, 2200);
+      } else {
+        setFabSyncState('ok', '完成');
+        showMsg(job.message || ('已同步 ' + (job.okCount || 0) + ' 个文件'), true);
+        setTimeout(function () { setFabSyncState('', '同步'); }, 1600);
+      }
+    }
+  }
+
+  function startSyncPoll() {
+    stopSyncPoll();
+    var tick = async function () {
+      try {
+        var data = await api('/api/sync');
+        applySyncJob(data.job);
+      } catch (_) {}
+    };
+    tick();
+    syncTimer = setInterval(tick, 1000);
+  }
+
+  async function runFabSync() {
+    setBusy(true, { keepEnabled: { fabSync: true, fabExpand: true, fabReload: true } });
+    setFabSyncState('run', '…');
+    showMsg('正在启动同步…', true);
+    try {
+      var data = await api('/api/sync', {
+        method: 'POST',
+        body: JSON.stringify({
+          characterId: $('characterId').value,
+          projectPath: $('projectPath').value.trim(),
+          message: 'sync from local console',
+        }),
+      });
+      if (!data.ok) {
+        setBusy(false);
+        setFabSyncState('err', '失败');
+        showMsg(data.error || '同步失败', false);
+        setTimeout(function () { setFabSyncState('', '同步'); }, 2200);
+        return;
+      }
+      applySyncJob(data.job);
+      startSyncPoll();
+    } catch (e) {
+      setBusy(false);
+      setFabSyncState('err', '失败');
+      showMsg(String(e.message || e), false);
+      setTimeout(function () { setFabSyncState('', '同步'); }, 2200);
+    }
+  }
+
+  var fabSync = $('fabSync');
+  if (fabSync) {
+    fabSync.addEventListener('click', function () {
+      runFabSync();
     });
   }
 
@@ -780,6 +922,11 @@
       setBusy(true);
       startPullPoll();
       switchPanel('pull');
+    }
+    if (status && status.sync && status.sync.running) {
+      setBusy(true, { keepEnabled: { fabSync: true, fabExpand: true, fabReload: true } });
+      applySyncJob(status.sync);
+      startSyncPoll();
     }
     if (status && status.preview && status.preview.running) {
       setStageLive(true);

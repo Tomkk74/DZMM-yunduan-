@@ -147,17 +147,21 @@
     </main>
   </div>
 
-  <!-- 侧栏收起后：悬浮发布键 + 展开菜单 -->
+  <!-- 侧栏收起后：中心发布 + 环绕 菜单/刷新/同步（悬停展开） -->
   <div id="fabDock" class="fab-dock" hidden>
-    <button type="button" class="fab-expand" id="fabExpand" title="按住拖动位置；单击展开菜单">菜单</button>
-    <button type="button" class="fab-expand" id="fabReload" title="只刷新中间预览">刷新</button>
-    <button type="button" class="fab-publish" id="fabPublish" title="直接发布到线上">
-      <svg class="fab-ring" viewBox="0 0 48 48" aria-hidden="true">
-        <circle class="fab-track" cx="24" cy="24" r="20"></circle>
-        <circle class="fab-prog" id="fabProg" cx="24" cy="24" r="20"></circle>
-      </svg>
-      <span class="fab-label" id="fabLabel">发布</span>
-    </button>
+    <div class="fab-orbit" id="fabOrbit">
+      <button type="button" class="fab-sat" id="fabExpand" data-slot="menu" title="展开侧栏菜单">菜单</button>
+      <button type="button" class="fab-sat" id="fabReload" data-slot="reload" title="只刷新中间预览">刷新</button>
+      <button type="button" class="fab-sat" id="fabSync" data-slot="sync" title="同步本地到云端容器">同步</button>
+      <button type="button" class="fab-publish" id="fabPublish" title="按住拖动；单击发布到线上">
+        <svg class="fab-ring" viewBox="0 0 48 48" aria-hidden="true">
+          <circle class="fab-track" cx="24" cy="24" r="20"></circle>
+          <circle class="fab-prog" id="fabProg" cx="24" cy="24" r="20"></circle>
+        </svg>
+        <span class="fab-label" id="fabLabel">发布</span>
+      </button>
+    </div>
+    <div id="fabToast" class="fab-toast" hidden></div>
   </div>
 
   <script src="./app.js"></script>

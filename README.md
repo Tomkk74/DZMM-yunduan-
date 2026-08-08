@@ -65,7 +65,16 @@
 
 ### 🖥️ 全屏预览 · 悬浮球
 
-点 **收起 / 全屏** 后侧栏隐藏，左下角出现可拖动的悬浮菜单：**菜单 / 刷新 / 发布**。
+点 **收起 / 全屏** 后侧栏隐藏，出现圆形 **发布** 键。鼠标移上去时，周围展开三颗卫星键：
+
+| 键 | 作用 |
+|:---|:---|
+| 📂 菜单 | 展开左侧控制台 |
+| 🔄 刷新 | 只刷新中间预览 |
+| ☁️ 同步 | **增量**同步：只上传有改动的文件到云端容器 |
+| 🚀 发布 | 中心键：拖动改位置；单击正式上线 |
+
+鼠标挪开后，卫星键会缓缓收拢消失。
 
 ![全屏与悬浮发布](docs/images/06-fullscreen-fab.png)
 
@@ -145,6 +154,7 @@ python lib\dzmm_studio.py login --email you@mail.com --password "***"
 python lib\dzmm_studio.py status --character-id <CHARACTER_ID>
 python lib\pull_container.py --character-id <CHARACTER_ID>
 python lib\dzmm_studio.py sync --character-id <CHARACTER_ID> --message "sync"
+# 默认增量（对照 _sync_meta.json）；强制全量加 --full
 ```
 
 拉取/同步目录取自网页保存的「本地项目路径」；留空则默认 `../{character_id}`。
