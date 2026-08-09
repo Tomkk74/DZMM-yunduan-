@@ -15,8 +15,12 @@
   var currentCardId = '';
   var currentCard = null;
   var currentCardMtime = 0;
+  var currentCardSig = '';
   var currentCardFolder = '';
   var cardPollTimer = null;
+  var cardPollBusy = false;
+  var lastDiskFieldValues = Object.create(null);
+  var CARD_POLL_MS = 200;
   var cardListPollTimer = null;
   var cardListPollBusy = false;
   var cardListPollTick = 0;
@@ -618,6 +622,87 @@
     }
   }
 
+  var ZOOM_ICON_SVG =
+    '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">' +
+    '<circle cx="10.5" cy="10.5" r="6.25" fill="none" stroke="currentColor" stroke-width="2"/>' +
+    '<path d="M15.2 15.2L20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>' +
+    '<path d="M10.5 8v5M8 10.5h5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>' +
+    '</svg>';
+
+  function paintZoomButtons(root) {
+    (root || document).querySelectorAll('.field-zoom-btn').forEach(function (btn) {
+      if (!btn.querySelector('svg')) btn.innerHTML = ZOOM_ICON_SVG;
+    });
+  }
+
+  function closeTextZoom() {
+    var modal = $('textZoomModal');
+    if (modal) modal.hidden = true;
+  }
+
+  function openTextZoom(title, text) {
+    var modal = $('textZoomModal');
+    var titleEl = $('textZoomTitle');
+    var body = $('textZoomBody');
+    if (!modal || !titleEl || !body) return;
+    titleEl.textContent = title || '全文预览';
+    var raw = String(text == null ? '' : text);
+    body.textContent = raw.trim() ? raw : '（空）';
+    modal.hidden = false;
+    body.scrollTop = 0;
+  }
+
+  function resolveZoomSource(btn) {
+    if (!btn) return null;
+    var targetId = btn.getAttribute('data-zoom-target');
+    if (targetId && $(targetId)) {
+      var el = $(targetId);
+      var label = btn.closest('label');
+      var span = label && label.querySelector(':scope > span');
+      return {
+        title: (span && span.textContent.trim()) || targetId,
+        text: el.value || '',
+      };
+    }
+    var box = btn.closest('.field-zoom-box');
+    var ta = box && box.querySelector('textarea');
+    if (!ta) return null;
+    var lab = btn.closest('label');
+    var head = lab && lab.querySelector(':scope > span');
+    var entry = btn.closest('.wb-entry');
+    var nameInput = entry && entry.querySelector('.wb-name');
+    var entryName = nameInput && nameInput.value.trim();
+    var base = (head && head.textContent.trim()) || '正文';
+    return {
+      title: entryName ? (base + ' · ' + entryName) : base,
+      text: ta.value || '',
+    };
+  }
+
+  function bindTextZoomUi() {
+    paintZoomButtons(document);
+    document.addEventListener('click', function (ev) {
+      var btn = ev.target && ev.target.closest && ev.target.closest('.field-zoom-btn');
+      if (btn) {
+        ev.preventDefault();
+        var src = resolveZoomSource(btn);
+        if (src) openTextZoom(src.title, src.text);
+        return;
+      }
+      if (ev.target && ev.target.id === 'textZoomModal') {
+        closeTextZoom();
+      }
+    });
+    if ($('textZoomCloseBtn')) {
+      $('textZoomCloseBtn').addEventListener('click', closeTextZoom);
+    }
+    document.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape' && $('textZoomModal') && !$('textZoomModal').hidden) {
+        closeTextZoom();
+      }
+    });
+  }
+
   function renderWorldBookEntries(entries) {
     var box = $('cardWbEntries');
     if (!box) return;
@@ -631,7 +716,10 @@
         '<button type="button" class="btn wb-del" data-idx="' + idx + '">删除</button></div>' +
         '<label><span>标题 name</span><input class="wb-name" type="text"></label>' +
         '<label><span>关键词 keys（逗号分隔；常驻可空）</span><input class="wb-keys" type="text"></label>' +
-        '<label><span>正文 content</span><textarea class="wb-content" rows="4"></textarea></label>' +
+        '<label class="field-zoom"><span>正文 content</span>' +
+        '<div class="field-zoom-box">' +
+        '<button type="button" class="field-zoom-btn" title="预览全文" aria-label="预览全文"></button>' +
+        '<textarea class="wb-content" rows="4"></textarea></div></label>' +
         '<div class="wb-checks">' +
         '<label><input class="wb-enabled" type="checkbox"> 启用</label>' +
         '<label><input class="wb-constant" type="checkbox"> 常驻 constant</label>' +
@@ -654,6 +742,7 @@
         field.addEventListener('input', updateCardPreview);
         field.addEventListener('change', updateCardPreview);
       });
+      paintZoomButtons(wrap);
     });
   }
 
@@ -679,55 +768,113 @@
     return out;
   }
 
+  function rememberDiskField(id, value) {
+    lastDiskFieldValues[id] = value == null ? '' : String(value);
+  }
+
+  function setInputFromDisk(id, value, opts) {
+    opts = opts || {};
+    var el = $(id);
+    if (!el) return false;
+    var next = value == null ? '' : String(value);
+    var ae = document.activeElement;
+    var prevDisk = Object.prototype.hasOwnProperty.call(lastDiskFieldValues, id)
+      ? lastDiskFieldValues[id]
+      : null;
+    // 网页里正在改这个框（与上次磁盘快照不一致）时不覆盖；只看盘时即使聚焦也热更新
+    if (ae === el && prevDisk !== null && el.value !== prevDisk && el.value !== next) {
+      return false;
+    }
+    if (el.value === next) {
+      rememberDiskField(id, next);
+      return false;
+    }
+    var stickBottom = false;
+    if (el.tagName === 'TEXTAREA') {
+      stickBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 48;
+    }
+    el.value = next;
+    rememberDiskField(id, next);
+    if (stickBottom) el.scrollTop = el.scrollHeight;
+    if (opts.forceCaretEnd && ae === el && typeof el.setSelectionRange === 'function') {
+      try {
+        var n = next.length;
+        el.setSelectionRange(n, n);
+      } catch (_) {}
+    }
+    return true;
+  }
+
   function fillCardForm(card, localId, opts) {
     opts = opts || {};
+    var live = !!opts.live;
+    var nextId = localId || (card && card._meta && card._meta.localId) || '';
+    var idChanged = !!(nextId && nextId !== currentCardId);
+    if (idChanged) {
+      lastDiskFieldValues = Object.create(null);
+      currentCardSig = '';
+      stopCardPoll();
+    }
     cardApplyingRemote = true;
     currentCard = card || null;
-    currentCardId = localId || (card && card._meta && card._meta.localId) || '';
+    currentCardId = nextId;
     currentCardFolder = (card && card._meta && card._meta.folder) || currentCardFolder || '';
     try {
       if (currentCardId) localStorage.setItem(CONSOLE_CARD_KEY, currentCardId);
     } catch (_) {}
     if (typeof opts.mtime === 'number') currentCardMtime = opts.mtime;
     else if (card && card._meta && card._meta.mtime) currentCardMtime = Number(card._meta.mtime) || currentCardMtime;
+    if (typeof opts.sig === 'string') currentCardSig = opts.sig;
     var d = (card && card.data) || {};
     var brief = (card && card._meta && card._meta.brief) || '';
     var book = d.character_book || {};
-    $('cardName').value = d.name || '';
-    $('cardDescription').value = d.description || '';
-    $('cardPersonality').value = d.personality || '';
-    $('cardScenario').value = d.scenario || '';
-    if ($('cardSystemPrompt')) $('cardSystemPrompt').value = d.system_prompt || '';
-    $('cardFirstMes').value = d.first_mes || '';
-    $('cardTags').value = tagsToText(d.tags);
-    $('cardNotes').value = d.creator_notes || '';
-    if ($('cardCreator')) $('cardCreator').value = d.creator || '';
-    if ($('cardVersion')) $('cardVersion').value = d.character_version || '';
-    if ($('cardBookName')) $('cardBookName').value = book.name || '世界设定';
-    renderWorldBookEntries(Array.isArray(book.entries) ? book.entries : []);
-    if ($('cardSuggestedReplies')) {
-      $('cardSuggestedReplies').value = Array.isArray(d.suggested_replies) ? d.suggested_replies.join('\n') : '';
+    var tagsText = tagsToText(d.tags);
+    var repliesText = Array.isArray(d.suggested_replies) ? d.suggested_replies.join('\n') : '';
+    var chatText = JSON.stringify(d.chat_history || [], null, 2);
+    var imageText = JSON.stringify(d.image_info || [], null, 2);
+    var voiceText = d.voice_settings == null ? '' : JSON.stringify(d.voice_settings, null, 2);
+    var touched = false;
+    touched = setInputFromDisk('cardName', d.name || '') || touched;
+    touched = setInputFromDisk('cardDescription', d.description || '') || touched;
+    touched = setInputFromDisk('cardPersonality', d.personality || '') || touched;
+    touched = setInputFromDisk('cardScenario', d.scenario || '') || touched;
+    touched = setInputFromDisk('cardSystemPrompt', d.system_prompt || '') || touched;
+    touched = setInputFromDisk('cardFirstMes', d.first_mes || '', { forceCaretEnd: live }) || touched;
+    touched = setInputFromDisk('cardTags', tagsText) || touched;
+    touched = setInputFromDisk('cardNotes', d.creator_notes || '') || touched;
+    touched = setInputFromDisk('cardCreator', d.creator || '') || touched;
+    touched = setInputFromDisk('cardVersion', d.character_version || '') || touched;
+    touched = setInputFromDisk('cardBookName', book.name || '世界设定') || touched;
+    touched = setInputFromDisk('cardSuggestedReplies', repliesText) || touched;
+    touched = setInputFromDisk('cardChatHistory', chatText) || touched;
+    touched = setInputFromDisk('cardAvatarUrl', d.avatar_url || '') || touched;
+    touched = setInputFromDisk('cardImageInfo', imageText) || touched;
+    touched = setInputFromDisk('cardVoiceSettings', voiceText) || touched;
+    touched = setInputFromDisk('cardBriefMain', brief) || touched;
+    touched = setInputFromDisk('cardBrief', brief) || touched;
+    if ($('cardFolderName') && currentCardId) {
+      touched = setInputFromDisk('cardFolderName', currentCardId) || touched;
     }
-    if ($('cardChatHistory')) {
-      $('cardChatHistory').value = JSON.stringify(d.chat_history || [], null, 2);
+
+    var ae = document.activeElement;
+    var focusInWb = !!(ae && $('cardWbEntries') && $('cardWbEntries').contains(ae));
+    if (!live || !focusInWb) {
+      renderWorldBookEntries(Array.isArray(book.entries) ? book.entries : []);
     }
-    if ($('cardAvatarUrl')) $('cardAvatarUrl').value = d.avatar_url || '';
-    updateAvatarPreview(d.avatar_url || '');
-    if ($('cardImageInfo')) $('cardImageInfo').value = JSON.stringify(d.image_info || [], null, 2);
-    renderImageGallery(Array.isArray(d.image_info) ? d.image_info : []);
-    if ($('cardVoiceSettings')) {
-      $('cardVoiceSettings').value = d.voice_settings == null
-        ? ''
-        : JSON.stringify(d.voice_settings, null, 2);
+    if (!live || (ae !== $('cardAvatarUrl'))) {
+      updateAvatarPreview(d.avatar_url || '');
     }
-    renderVoiceSelected(d.voice_settings || null);
-    renderVoiceList();
-    if ($('cardBriefMain')) $('cardBriefMain').value = brief;
-    if ($('cardBrief')) $('cardBrief').value = brief;
-    if ($('cardFolderName') && currentCardId) $('cardFolderName').value = currentCardId;
+    if (!live || (ae !== $('cardImageInfo'))) {
+      renderImageGallery(Array.isArray(d.image_info) ? d.image_info : []);
+    }
+    if (!live || (ae !== $('cardVoiceSettings'))) {
+      renderVoiceSelected(d.voice_settings || null);
+      renderVoiceList();
+    }
+
     var wbCount = (book.entries && book.entries.length) || 0;
-    $('cardStageMeta').textContent = (currentCardFolder || ('卡/' + currentCardId)) +
-      ' · 世界书 ' + wbCount + ' 条';
+    var metaBase = (currentCardFolder || ('卡/' + currentCardId)) + ' · 世界书 ' + wbCount + ' 条';
+    $('cardStageMeta').textContent = live && touched ? (metaBase + ' · 实时同步') : metaBase;
     updateCardPreview();
     cardApplyingRemote = false;
     if (currentCardId) startCardPoll();
@@ -782,30 +929,49 @@
       clearInterval(cardPollTimer);
       cardPollTimer = null;
     }
+    cardPollBusy = false;
+  }
+
+  async function pollCardOnce() {
+    if (!currentCardId || !isCardMode() || cardPlayMode || cardPollBusy) return;
+    cardPollBusy = true;
+    try {
+      var data = await api(
+        '/api/card/poll?id=' + encodeURIComponent(currentCardId) +
+        '&since=' + encodeURIComponent(String(currentCardMtime || 0)) +
+        '&sig=' + encodeURIComponent(String(currentCardSig || ''))
+      );
+      if (!data.ok || !data.changed || !data.card) {
+        if (data && data.ok) {
+          if (typeof data.mtime === 'number') currentCardMtime = data.mtime;
+          if (typeof data.sig === 'string') currentCardSig = data.sig;
+        }
+        return;
+      }
+      fillCardForm(data.card, data.localId || currentCardId, {
+        mtime: data.mtime || 0,
+        sig: data.sig || '',
+        live: true,
+      });
+      currentCardFolder = data.folder || currentCardFolder;
+      setCardMsg('实时同步 · 卡/' + (data.localId || currentCardId), true);
+    } catch (_) {
+      // 静默：轮询失败不打断编辑
+    } finally {
+      cardPollBusy = false;
+    }
   }
 
   function startCardPoll() {
-    stopCardPoll();
-    if (!currentCardId) return;
-    cardPollTimer = setInterval(async function () {
-      if (!currentCardId || !isCardMode()) return;
-      // 正在某个字段打字时不覆盖；失焦后立刻吃磁盘更新
-      var ae = document.activeElement;
-      var form = $('cardForm');
-      if (form && ae && form.contains(ae) && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA')) {
-        return;
-      }
-      try {
-        var data = await api(
-          '/api/card/poll?id=' + encodeURIComponent(currentCardId) +
-          '&since=' + encodeURIComponent(String(currentCardMtime || 0))
-        );
-        if (!data.ok || !data.changed || !data.card) return;
-        fillCardForm(data.card, data.localId || currentCardId, { mtime: data.mtime || 0 });
-        currentCardFolder = data.folder || currentCardFolder;
-        setCardMsg('已同步本地文件 · ' + (data.localId || currentCardId), true);
-      } catch (_) {}
-    }, 700);
+    if (!currentCardId) {
+      stopCardPoll();
+      return;
+    }
+    if (cardPollTimer) return; // 已在跑，避免 fill 时反复重启丢掉节拍
+    cardPollTimer = setInterval(function () {
+      void pollCardOnce();
+    }, CARD_POLL_MS);
+    void pollCardOnce();
   }
 
   function stopCardListPoll() {
@@ -1054,6 +1220,8 @@
         currentCard = null;
         currentCardFolder = '';
         currentCardMtime = 0;
+        currentCardSig = '';
+        lastDiskFieldValues = Object.create(null);
         stopCardPoll();
         try { localStorage.removeItem(CONSOLE_CARD_KEY); } catch (_) {}
         if ($('cardStageMeta')) $('cardStageMeta').textContent = '未打开卡';
@@ -1426,7 +1594,10 @@
         showMsg(data.error || '打开失败', false);
         return;
       }
-      fillCardForm(data.card, data.localId || localId, { mtime: data.mtime || 0 });
+      fillCardForm(data.card, data.localId || localId, {
+        mtime: data.mtime || 0,
+        sig: data.sig || '',
+      });
       currentCardFolder = data.folder || '';
       setStageMode('card');
       setCardFullscreen(true);
@@ -3523,6 +3694,7 @@
       }
     });
   }
+  bindTextZoomUi();
   updatePlayGate();
   if ($('cardRefreshBtn')) {
     $('cardRefreshBtn').addEventListener('click', function () { refreshCardList(); });
@@ -3534,6 +3706,13 @@
         return;
       }
       openLocalCard(currentCardId);
+    });
+  }
+  if ($('cardForm')) {
+    // 网页改完某框失焦后，立刻吃本地磁盘更新（AI/编辑器写入）
+    $('cardForm').addEventListener('focusout', function () {
+      if (!currentCardId || !isCardMode() || cardPlayMode) return;
+      setTimeout(function () { void pollCardOnce(); }, 30);
     });
   }
   if ($('cardCloudBtn')) {

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import re
@@ -237,6 +238,30 @@ def folder_mtime(local_id: str) -> float:
         except OSError:
             continue
     return latest
+
+
+def folder_fingerprint(local_id: str) -> str:
+    """Detect disk edits even when mtime resolution is coarse (size + mtime_ns)."""
+    d = _card_dir(local_id)
+    if not d.is_dir():
+        return ""
+    parts: list[str] = []
+    try:
+        for p in sorted(d.rglob("*")):
+            if not p.is_file():
+                continue
+            if p.suffix.lower() not in (".txt", ".json", ".png", ".jpg", ".jpeg", ".webp", ".gif"):
+                continue
+            try:
+                st = p.stat()
+                rel = p.relative_to(d).as_posix()
+                ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))
+                parts.append(f"{rel}:{ns}:{st.st_size}")
+            except OSError:
+                continue
+    except OSError:
+        return ""
+    return hashlib.md5("|".join(parts).encode("utf-8", "replace")).hexdigest()
 
 
 def _load_world_book(d: Path) -> dict:
@@ -953,17 +978,21 @@ def set_voice_settings(local_id: str, voice: dict | None, settings: dict | None 
     return write_folder(card, local_id=local_id)
 
 
-def poll_local(local_id: str, since_mtime: float = 0.0) -> dict:
+def poll_local(local_id: str, since_mtime: float = 0.0, since_sig: str = "") -> dict:
     mtime = folder_mtime(local_id)
-    changed = mtime > float(since_mtime or 0)
+    sig = folder_fingerprint(local_id)
+    since_m = float(since_mtime or 0)
+    since_s = str(since_sig or "").strip()
+    changed = (mtime > since_m) or (bool(sig) and sig != since_s) or since_m <= 0
     payload = {
         "ok": True,
         "localId": _safe_folder_name(local_id),
         "mtime": mtime,
+        "sig": sig,
         "changed": changed,
         "folder": str(_card_dir(local_id)),
     }
-    if changed or since_mtime <= 0:
+    if changed:
         payload["card"] = load_from_folder(local_id)
     return payload
 

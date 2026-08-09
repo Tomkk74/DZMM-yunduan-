@@ -1060,11 +1060,13 @@ def _proxy_card_play_generate(handler, body: dict) -> None:
 def do_card_get(local_id: str) -> dict:
     try:
         card = character.load_local(local_id)
+        lid = (card.get("_meta") or {}).get("localId") or local_id
         return {
             "ok": True,
-            "localId": (card.get("_meta") or {}).get("localId") or local_id,
+            "localId": lid,
             "folder": (card.get("_meta") or {}).get("folder") or "",
             "mtime": float((card.get("_meta") or {}).get("mtime") or 0),
+            "sig": character.folder_fingerprint(str(lid)),
             "card": card,
         }
     except Exception as e:
@@ -1159,9 +1161,9 @@ def do_card_ai(body: dict) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-def do_card_poll(local_id: str, since_mtime: float = 0.0) -> dict:
+def do_card_poll(local_id: str, since_mtime: float = 0.0, since_sig: str = "") -> dict:
     try:
-        data = character.poll_local(local_id, since_mtime=since_mtime)
+        data = character.poll_local(local_id, since_mtime=since_mtime, since_sig=since_sig)
         data["ok"] = True
         return data
     except Exception as e:
@@ -1646,7 +1648,8 @@ class Handler(BaseHTTPRequestHandler):
                 since = float((qs.get("since") or ["0"])[0] or 0)
             except Exception:
                 since = 0.0
-            result = do_card_poll(local_id, since_mtime=since)
+            since_sig = (qs.get("sig") or [""])[0] or ""
+            result = do_card_poll(local_id, since_mtime=since, since_sig=since_sig)
             _json(self, 200 if result.get("ok") else 404, result)
             return
         if path == "/api/card/asset":

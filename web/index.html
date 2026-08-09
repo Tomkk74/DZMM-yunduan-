@@ -221,9 +221,12 @@
             </nav>
 
             <section class="card-tab-panel active" data-card-panel="basic">
-              <label>
+              <label class="field-zoom">
                 <span>创意简述 brief</span>
-                <textarea id="cardBriefMain" rows="2" placeholder="角色定位、背景、关系与冲突、语气风格等…"></textarea>
+                <div class="field-zoom-box">
+                  <button type="button" class="field-zoom-btn" title="预览全文" aria-label="预览全文" data-zoom-target="cardBriefMain"></button>
+                  <textarea id="cardBriefMain" rows="2" placeholder="角色定位、背景、关系与冲突、语气风格等…"></textarea>
+                </div>
               </label>
               <div class="card-fields-grid">
                 <label>
@@ -242,25 +245,40 @@
                   <span>版本 character_version</span>
                   <input id="cardVersion" type="text" placeholder="可选">
                 </label>
-                <label class="span-2">
+                <label class="span-2 field-zoom">
                   <span>详细描述 description</span>
-                  <textarea id="cardDescription" rows="4" placeholder="背景故事、重要经历、能力特长、关系网络…（可按 性别/年龄/性格/外貌/性癖 结构写）"></textarea>
+                  <div class="field-zoom-box">
+                    <button type="button" class="field-zoom-btn" title="预览全文" aria-label="预览全文" data-zoom-target="cardDescription"></button>
+                    <textarea id="cardDescription" rows="4" placeholder="背景故事、重要经历、能力特长、关系网络…（可按 性别/年龄/性格/外貌/性癖 结构写）"></textarea>
+                  </div>
                 </label>
-                <label>
+                <label class="field-zoom">
                   <span>性格 personality</span>
-                  <textarea id="cardPersonality" rows="4" placeholder="基本特质、情感表现、人际、价值观、行为模式、优缺点…"></textarea>
+                  <div class="field-zoom-box">
+                    <button type="button" class="field-zoom-btn" title="预览全文" aria-label="预览全文" data-zoom-target="cardPersonality"></button>
+                    <textarea id="cardPersonality" rows="4" placeholder="基本特质、情感表现、人际、价值观、行为模式、优缺点…"></textarea>
+                  </div>
                 </label>
-                <label>
+                <label class="field-zoom">
                   <span>场景 scenario</span>
-                  <textarea id="cardScenario" rows="4" placeholder="物理环境、氛围、时间、相关人物、角色位置与情感联系…"></textarea>
+                  <div class="field-zoom-box">
+                    <button type="button" class="field-zoom-btn" title="预览全文" aria-label="预览全文" data-zoom-target="cardScenario"></button>
+                    <textarea id="cardScenario" rows="4" placeholder="物理环境、氛围、时间、相关人物、角色位置与情感联系…"></textarea>
+                  </div>
                 </label>
-                <label class="span-2">
+                <label class="span-2 field-zoom">
                   <span>系统指令 system_prompt</span>
-                  <textarea id="cardSystemPrompt" rows="4" placeholder="语言风格、知识范围、行为模式、情感表达、互动规则、能力/立场…（写可执行规则）"></textarea>
+                  <div class="field-zoom-box">
+                    <button type="button" class="field-zoom-btn" title="预览全文" aria-label="预览全文" data-zoom-target="cardSystemPrompt"></button>
+                    <textarea id="cardSystemPrompt" rows="4" placeholder="语言风格、知识范围、行为模式、情感表达、互动规则、能力/立场…（写可执行规则）"></textarea>
+                  </div>
                 </label>
-                <label class="span-2">
+                <label class="span-2 field-zoom">
                   <span>角色卡介绍 creator_notes（AI 不可见）</span>
-                  <textarea id="cardNotes" rows="3" placeholder="给用户的概述、互动指南、玩法建议、版本说明…"></textarea>
+                  <div class="field-zoom-box">
+                    <button type="button" class="field-zoom-btn" title="预览全文" aria-label="预览全文" data-zoom-target="cardNotes"></button>
+                    <textarea id="cardNotes" rows="3" placeholder="给用户的概述、互动指南、玩法建议、版本说明…"></textarea>
+                  </div>
                 </label>
               </div>
             </section>
@@ -278,9 +296,9 @@
             </section>
 
             <section class="card-tab-panel" data-card-panel="dialogue" hidden>
-              <label>
+              <label class="card-first-mes-label">
                 <span>开场白 first_mes（兼容；完整模式以对话流为准）</span>
-                <textarea id="cardFirstMes" rows="4" placeholder="角色第一句…"></textarea>
+                <textarea id="cardFirstMes" class="card-first-mes" rows="28" placeholder="角色第一句…"></textarea>
               </label>
               <label>
                 <span>建议回复 suggested_replies（一行一条）</span>
@@ -465,6 +483,16 @@
         </div>
       </div>
     </main>
+  </div>
+
+  <div id="textZoomModal" class="text-zoom-modal" hidden>
+    <div class="text-zoom-dialog" role="dialog" aria-modal="true" aria-labelledby="textZoomTitle">
+      <header class="text-zoom-head">
+        <strong id="textZoomTitle">全文预览</strong>
+        <button type="button" class="btn" id="textZoomCloseBtn">关闭</button>
+      </header>
+      <pre id="textZoomBody" class="text-zoom-body"></pre>
+    </div>
   </div>
 
   <!-- 侧栏收起后：中心发布 + 环绕 菜单/刷新/同步（悬停展开） -->

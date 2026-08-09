@@ -625,6 +625,110 @@ textarea:focus {
 .card-tab-panel[hidden] { display: none !important; }
 .card-tab-panel { display: grid; gap: 12px; }
 
+.field-zoom {
+  position: relative;
+}
+.field-zoom-box {
+  position: relative;
+}
+.field-zoom-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 2;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 2px solid var(--ink);
+  border-radius: 0;
+  background: #fff;
+  color: var(--ink);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 2px 2px 0 rgb(0 0 0 / 12%);
+}
+.field-zoom-btn:hover {
+  background: var(--paper, #f6f1e8);
+}
+.field-zoom-btn:focus {
+  outline: 2px solid var(--ink);
+  outline-offset: 1px;
+}
+.field-zoom-box textarea {
+  padding-right: 38px;
+}
+.field-zoom-btn svg {
+  width: 15px;
+  height: 15px;
+  display: block;
+}
+
+.text-zoom-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgb(0 0 0 / 40%);
+  padding: 16px;
+}
+.text-zoom-modal[hidden] {
+  display: none !important;
+}
+.text-zoom-dialog {
+  width: min(920px, 100%);
+  max-height: min(88vh, 960px);
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  border: 2px solid var(--ink);
+  box-shadow: 0 14px 36px rgb(0 0 0 / 22%);
+}
+.text-zoom-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid #ddd;
+}
+.text-zoom-head strong {
+  font-size: 15px;
+}
+.text-zoom-body {
+  flex: 1 1 auto;
+  margin: 0;
+  padding: 14px 16px 18px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: 500 14px/1.65 var(--font);
+  color: var(--ink);
+  background: #faf8f4;
+  min-height: 240px;
+}
+
+/* 开场白尽量占满可视高度，方便长文实时对照 */
+.card-first-mes-label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+}
+textarea.card-first-mes,
+#cardFirstMes.card-first-mes {
+  min-height: min(72vh, 920px);
+  height: min(72vh, 920px);
+  max-height: none;
+  resize: vertical;
+  line-height: 1.55;
+  font-size: 14px;
+}
+
 .card-fields-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
