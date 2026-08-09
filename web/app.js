@@ -89,7 +89,7 @@
   function setBusy(busy, opts) {
     opts = opts || {};
     var keep = opts.keepEnabled || {};
-    ['loginBtn', 'logoutBtn', 'pingBtn', 'pullBtn', 'pullRetryBtn', 'previewStartBtn', 'previewStopBtn', 'previewReloadBtn', 'publishBtn', 'bridgeRefreshBtn', 'fabPublish', 'fabReload', 'fabSync', 'fabExpand', 'cardAiBtn', 'cardCopyPromptBtn', 'cardNewBtn2', 'cardSaveBtn', 'cardExportPngBtn', 'cardRefreshBtn', 'cardCloudBtn', 'cardReloadBtn', 'cardMenuBtn', 'cardVoiceRefreshBtn', 'cardVoiceClearBtn', 'cardPublishBtn', 'cardDraftBtn', 'cardCloudFilterAll', 'cardCloudFilterDraft', 'cardCloudFilterPub', 'cardCloudSearch'].forEach(function (id) {
+    ['loginBtn', 'logoutBtn', 'pingBtn', 'pullBtn', 'pullRetryBtn', 'previewStartBtn', 'previewStopBtn', 'previewReloadBtn', 'publishBtn', 'bridgeRefreshBtn', 'fabPublish', 'fabReload', 'fabSync', 'fabExpand', 'originProbeBtn', 'originSelect', 'cardAiBtn', 'cardCopyPromptBtn', 'cardNewBtn2', 'cardSaveBtn', 'cardExportPngBtn', 'cardRefreshBtn', 'cardCloudBtn', 'cardReloadBtn', 'cardMenuBtn', 'cardVoiceRefreshBtn', 'cardVoiceClearBtn', 'cardPublishBtn', 'cardDraftBtn', 'cardCloudFilterAll', 'cardCloudFilterDraft', 'cardCloudFilterPub', 'cardCloudSearch'].forEach(function (id) {
       var el = $(id);
       if (!el) return;
       if (busy && keep[id]) {
@@ -1642,8 +1642,31 @@
     }
   }
 
+  var lastPullJob = null;
+
+  function confirmRetryFailedPull(job) {
+    var failed = (job && job.failedPaths) || [];
+    if (!failed.length) {
+      showMsg('当前没有失败文件可重拉', false);
+      return false;
+    }
+    var lines = [
+      '将只重拉上次失败的 ' + failed.length + ' 个文件（不会全量拉取）。',
+      '',
+    ];
+    failed.slice(0, 10).forEach(function (p) { lines.push('· ' + p); });
+    if (failed.length > 10) lines.push('· … 另有 ' + (failed.length - 10) + ' 个');
+    if (job && job.out) {
+      lines.push('');
+      lines.push('输出目录：' + job.out);
+    }
+    lines.push('', '继续？');
+    return window.confirm(lines.join('\n'));
+  }
+
   function renderPull(job) {
     if (!job) return;
+    lastPullJob = job;
     var total = job.total || 0;
     var current = job.current || 0;
     var pct = total > 0 ? Math.min(100, Math.round((current / total) * 100)) : (job.done ? 100 : 0);
@@ -1655,7 +1678,17 @@
     var retryBtn = $('pullRetryBtn');
     var retryHint = $('pullRetryHint');
     if (retryBtn) retryBtn.hidden = !canRetry;
-    if (retryHint) retryHint.hidden = !canRetry;
+    if (retryHint) {
+      retryHint.hidden = !canRetry;
+      if (canRetry) {
+        retryHint.textContent =
+          '提醒：还有 ' + failedPaths.length + ' 个失败文件，请点「重拉失败文件」只补下这些（不会全量重拉）。';
+        retryHint.classList.add('is-alert');
+      } else {
+        retryHint.textContent = '有失败文件时可点「重拉失败文件」只补下失败项，不会全量重拉。';
+        retryHint.classList.remove('is-alert');
+      }
+    }
 
     var lines = [];
     if (job.message) lines.push(job.message);
@@ -1664,7 +1697,7 @@
     if (job.out) lines.push('输出目录: ' + job.out);
     if (job.error) lines.push('错误: ' + job.error);
     if (failedPaths.length && !job.running) {
-      lines.push('失败文件 ' + failedPaths.length + ' 个（可点「重拉失败文件」）:');
+      lines.push('失败文件 ' + failedPaths.length + ' 个（请点上方「重拉失败文件」）:');
       failedPaths.slice(0, 12).forEach(function (p) { lines.push('  - ' + p); });
       if (failedPaths.length > 12) lines.push('  … 另有 ' + (failedPaths.length - 12) + ' 个');
     }
@@ -1675,11 +1708,65 @@
     $('pullLog').textContent = lines.join('\n') || '尚未开始';
   }
 
+  function fillOriginSelect(status) {
+    var sel = $('originSelect');
+    if (!sel) return;
+    var origins = status.origins || [];
+    var cur = status.origin || '';
+    var html = origins.map(function (o) {
+      return '<option value="' + o.replace(/"/g, '&quot;') + '"' + (o === cur ? ' selected' : '') + '>' + o.replace(/^https:\/\//, '') + '</option>';
+    }).join('');
+    if (cur && origins.indexOf(cur) < 0) {
+      html = '<option value="' + cur.replace(/"/g, '&quot;') + '" selected>' + cur.replace(/^https:\/\//, '') + '</option>' + html;
+    }
+    sel.innerHTML = html || '<option value="https://www.dzmm.ai">www.dzmm.ai</option>';
+    if (cur) sel.value = cur;
+    var link = $('addrPageLink');
+    if (link && status.addrPage) link.href = status.addrPage;
+    var hint = $('originHint');
+    if (hint) {
+      var hostOnly = String(cur || '').replace(/^https?:\/\//, '').replace(/^www\./, '');
+      if (cur && /dzmm\.ai$/i.test(hostOnly)) {
+        hint.hidden = false;
+        hint.classList.add('is-alert');
+        hint.textContent = '当前是海外主站 www.dzmm.ai。若登录/拉取被拦截，请点「测速并优选」或手动换国内线路后重新登录。';
+      } else {
+        hint.hidden = false;
+        hint.classList.remove('is-alert');
+        hint.textContent = '当前线路：' + (cur || '未设置') + '（换线路后需重新登录）';
+      }
+    }
+  }
+
   function fillForm(status) {
     if (status.email && !$('email').value) $('email').value = status.email;
     if (status.characterId) $('characterId').value = status.characterId;
     if (status.projectPath) $('projectPath').value = status.projectPath;
     if (status.previewPort) $('previewPort').value = status.previewPort;
+    fillOriginSelect(status);
+    var pathHint = $('projectPathHint');
+    if (pathHint) {
+      var resolveErr = status.projectResolveError || '';
+      var resolveHint = status.projectResolveHint || '';
+      var pullFailed = Number(status.pullFailedCount || 0) || 0;
+      if (resolveErr) {
+        pathHint.hidden = false;
+        pathHint.classList.add('is-alert');
+        pathHint.textContent = resolveErr.replace(/\n/g, ' ');
+      } else if (resolveHint) {
+        pathHint.hidden = false;
+        pathHint.classList.remove('is-alert');
+        pathHint.textContent = resolveHint;
+      } else if (pullFailed > 0 && !status.publishIndexExists) {
+        pathHint.hidden = false;
+        pathHint.classList.add('is-alert');
+        pathHint.textContent = '路径已设置，但还有 ' + pullFailed + ' 个拉取失败文件；请到「拉取容器」重拉失败文件后再预览。';
+      } else {
+        pathHint.hidden = true;
+        pathHint.classList.remove('is-alert');
+        pathHint.textContent = '';
+      }
+    }
     var link = $('workbenchLink');
     if (status.workbenchUrl) {
       link.href = status.workbenchUrl;
@@ -1702,6 +1789,7 @@
       characterId: status.characterId,
       projectPath: status.projectPath || '(未设置)',
       previewPort: status.previewPort,
+      origin: status.origin || '',
       workbenchUrl: status.workbenchUrl || '',
       kitRoot: status.kitRoot,
       hasPassword: status.hasPassword,
@@ -1743,14 +1831,70 @@
           stopPullPoll();
           setBusy(false);
           await refresh();
-          if (data.job.error && !(data.job.result && data.job.result.ok)) {
+          var failedN = ((data.job.failedPaths) || []).length || Number(data.job.failCount || 0) || 0;
+          var stillFail = !!(data.job.error && !(data.job.result && data.job.result.ok)) || failedN > 0;
+          if (stillFail && failedN > 0) {
+            showMsg(
+              (data.job.mode === 'retry' ? '重拉结束' : '拉取结束') +
+                '：仍有 ' + failedN + ' 个失败 · 请点「重拉失败文件」继续补下',
+              false
+            );
+            switchPanel('pull');
+          } else if (stillFail) {
             showMsg(data.job.error || data.job.message || '拉取结束（有失败）', false);
+          } else if (data.job.mode === 'retry') {
+            showMsg(data.job.message || '失败文件已全部重拉成功', true);
           } else {
             showMsg(data.job.message || '拉取完成', true);
           }
         }
       } catch (_) {}
     }, 800);
+  }
+
+  if ($('originSelect')) {
+    $('originSelect').addEventListener('change', async function () {
+      var origin = $('originSelect').value;
+      if (!origin) return;
+      if (!confirm('切换到 ' + origin + '？\n换域后会清除本机 cookie，需要重新登录。')) {
+        await refresh();
+        return;
+      }
+      setBusy(true);
+      showMsg('正在切换线路…', true);
+      try {
+        var data = await api('/api/origin', {
+          method: 'POST',
+          body: JSON.stringify({ origin: origin }),
+        });
+        if (data.status) fillForm(data.status);
+        showMsg(data.message || (data.ok ? '线路已切换，请重新登录' : (data.error || '切换失败')), !!data.ok);
+      } catch (e) {
+        showMsg(String(e.message || e), false);
+      } finally {
+        setBusy(false);
+      }
+    });
+  }
+
+  if ($('originProbeBtn')) {
+    $('originProbeBtn').addEventListener('click', async function () {
+      setBusy(true);
+      showMsg('正在测速各线路（约数秒）…', true);
+      try {
+        var data = await api('/api/origin', {
+          method: 'POST',
+          body: JSON.stringify({ auto: true }),
+        });
+        if (data.status) fillForm(data.status);
+        else if (data.origin) fillOriginSelect({ origin: data.origin, origins: (data.results || []).map(function (r) { return r.origin; }), addrPage: data.addrPage });
+        showMsg(data.message || (data.ok ? ('已优选 ' + data.origin) : (data.error || '测速失败')), !!data.ok);
+      } catch (e) {
+        showMsg(String(e.message || e), false);
+      } finally {
+        setBusy(false);
+      }
+    });
   }
 
   $('loginForm').addEventListener('submit', async function (ev) {
@@ -1767,6 +1911,7 @@
           characterId: $('characterId').value,
           projectPath: $('projectPath').value.trim(),
           previewPort: $('previewPort').value,
+          origin: $('originSelect') ? $('originSelect').value : undefined,
         }),
       });
       if (data.status) fillForm(data.status);
@@ -1870,7 +2015,15 @@
           startBridgePoll();
         }
       } else {
-        showMsg(data.error || '预览启动失败', false);
+        var errText = data.error || '预览启动失败';
+        showMsg(String(errText).split('\n')[0], false);
+        if (data.canRetryFailed || /重拉失败文件/.test(String(errText))) {
+          if (window.confirm(String(errText) + '\n\n现在去「拉取容器」重拉失败文件？')) {
+            switchPanel('pull');
+          }
+        } else if (String(errText).indexOf('\n') >= 0) {
+          window.alert(String(errText));
+        }
       }
     } catch (e) {
       showMsg(String(e.message || e), false);
@@ -2175,7 +2328,7 @@
     });
   }
 
-  async function startPullRequest(path, busyText) {
+  async function startPullRequest(path, busyText, extraBody) {
     setBusy(true);
     showMsg(busyText, true);
     try {
@@ -2190,10 +2343,10 @@
       });
       var data = await api(path, {
         method: 'POST',
-        body: JSON.stringify({
+        body: JSON.stringify(Object.assign({
           characterId: $('characterId').value,
           projectPath: $('projectPath').value.trim(),
-        }),
+        }, extraBody || {})),
       });
       if (data.job) renderPull(data.job);
       if (data.status) fillForm(data.status);
@@ -2216,8 +2369,15 @@
   });
 
   $('pullRetryBtn').addEventListener('click', async function () {
-    if (!confirm('只重新下载上次失败的文件（不全量拉取）。继续？')) return;
-    startPullRequest('/api/pull/retry', '正在重试失败文件…');
+    var job = lastPullJob || {};
+    var failed = job.failedPaths || [];
+    if (!confirmRetryFailedPull(job)) return;
+    showMsg('提醒：即将只重拉 ' + failed.length + ' 个失败文件', true);
+    startPullRequest(
+      '/api/pull/retry',
+      '正在重拉 ' + failed.length + ' 个失败文件…',
+      { failedPaths: failed }
+    );
   });
 
   document.querySelectorAll('.mode-item').forEach(function (btn) {

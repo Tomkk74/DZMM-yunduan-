@@ -125,7 +125,16 @@ def build_status() -> dict:
     project = str(studio.project_root())
     cid = int(cfg.get("character_id") or 0)
     project_path = project if project != str(studio.KIT_ROOT) else (cfg.get("project_path") or "")
-    if project_path:
+    resolved = studio.resolve_game_project(project_path) if project_path else {
+        "ok": False,
+        "root": Path(),
+        "hint": "",
+        "error": "",
+        "failedPaths": [],
+    }
+    if project_path and resolved.get("ok") and resolved.get("root"):
+        project_path = str(resolved["root"])
+    elif project_path:
         project_path = str(studio.normalize_project_root(project_path))
     return {
         "ok": True,
@@ -137,13 +146,48 @@ def build_status() -> dict:
         "characterId": cid,
         "projectPath": project_path,
         "previewPort": int(cfg.get("preview_port") or 8791),
+        "origin": studio.get_origin(),
+        "origins": studio.list_origin_choices(),
+        "addrPage": studio.ADDR_PAGE,
         "workbenchUrl": (
-            f"{studio.ORIGIN}/studio/game-creation/workbench?character_id={cid}" if cid else ""
+            f"{studio.get_origin()}/studio/game-creation/workbench?character_id={cid}" if cid else ""
         ),
         "kitRoot": str(studio.KIT_ROOT),
-        "publishIndexExists": (Path(project_path) / "publish" / "index.html").is_file() if project_path else False,
+        "publishIndexExists": bool(resolved.get("ok")),
+        "projectResolveHint": resolved.get("hint") or "",
+        "projectResolveError": resolved.get("error") or "",
+        "pullFailedCount": len(resolved.get("failedPaths") or []),
         "error": error,
         "preview": preview_snapshot(),
+    }
+
+
+def do_origin_get() -> dict:
+    return {
+        "ok": True,
+        "origin": studio.get_origin(),
+        "origins": studio.list_origin_choices(),
+        "addrPage": studio.ADDR_PAGE,
+        "status": build_status(),
+    }
+
+
+def do_origin_set(body: dict) -> dict:
+    body = body or {}
+    if body.get("auto") or body.get("probe"):
+        result = studio.pick_fastest_origin(timeout=float(body.get("timeout") or 6))
+        result["status"] = build_status()
+        return result
+    raw = str(body.get("origin") or "").strip()
+    if not raw:
+        return {"ok": False, "error": "缺少 origin", "status": build_status()}
+    origin = studio.set_origin(raw, clear_cookie=True)
+    return {
+        "ok": True,
+        "origin": origin,
+        "message": f"已切换到 {origin}。换域后请重新登录。",
+        "addrPage": studio.ADDR_PAGE,
+        "status": build_status(),
     }
 
 
@@ -154,6 +198,7 @@ def do_login(body: dict) -> dict:
     character_id = body.get("characterId")
     project_path = body.get("projectPath")
     preview_port = body.get("previewPort")
+    origin = body.get("origin")
 
     updates = {}
     if character_id is not None and str(character_id).strip() != "":
@@ -162,6 +207,9 @@ def do_login(body: dict) -> dict:
         updates["project_path"] = str(project_path).strip()
     if preview_port is not None and str(preview_port).strip() != "":
         updates["preview_port"] = int(preview_port)
+    if origin is not None and str(origin).strip() != "":
+        studio.set_origin(origin, clear_cookie=False)
+        updates["origin"] = studio.get_origin()
     if updates:
         studio.save_config(updates)
 
@@ -200,6 +248,10 @@ def do_save_config(body: dict) -> dict:
         updates["project_path"] = str(body.get("projectPath") or "").strip()
     if "previewPort" in body:
         updates["preview_port"] = int(body.get("previewPort") or 8791)
+    if "origin" in body and str(body.get("origin") or "").strip():
+        # 换线路：清 cookie，需重新登录
+        origin = studio.set_origin(body.get("origin"), clear_cookie=True)
+        updates["origin"] = origin
     studio.save_config(updates)
     env_email = (studio._read_env_map().get("email") or "").strip()
     if body.get("email"):
@@ -232,7 +284,7 @@ def do_ping_editor() -> dict:
             "gameId": game_id,
             "editorStatus": info.get("status"),
             "containerId": info.get("containerId"),
-            "workbenchUrl": f"{studio.ORIGIN}/studio/game-creation/workbench?character_id={cid}",
+            "workbenchUrl": f"{studio.get_origin()}/studio/game-creation/workbench?character_id={cid}",
             "status": build_status(),
         }
     except SystemExit as e:
@@ -1479,17 +1531,21 @@ def do_start_preview(body: dict) -> dict:
 
     if not project:
         project = str(puller.default_out_dir(cid))
-    project_path = studio.normalize_project_root(project)
-    index = project_path / "publish" / "index.html"
-    if not index.is_file():
+    resolved = studio.resolve_game_project(project)
+    if not resolved.get("ok"):
+        err = resolved.get("error") or "本地项目无法预览"
+        failed_n = len(resolved.get("failedPaths") or [])
         return {
             "ok": False,
-            "error": (
-                f"本地没有 publish/index.html。请填「游戏项目根目录」"
-                f"（内含 publish/），不要只填到 publish 子目录：{project_path}"
-            ),
-            "status": status,
+            "error": err,
+            "canRetryFailed": failed_n > 0,
+            "failedCount": failed_n,
+            "status": build_status(),
         }
+
+    project_path = Path(resolved["root"])
+    publish_dir = Path(resolved["publish_dir"])
+    hint = str(resolved.get("hint") or "")
 
     studio.save_config({
         "character_id": cid,
@@ -1507,6 +1563,8 @@ def do_start_preview(body: dict) -> dict:
         str(port),
         "--project-root",
         str(project_path),
+        "--publish-dir",
+        str(publish_dir),
         "--no-open",
     ]
 
@@ -1536,15 +1594,19 @@ def do_start_preview(body: dict) -> dict:
 
         _PREVIEW_PROC = proc
         url = f"http://127.0.0.1:{port}/"
+        boot_msg = "正在启动预览…"
+        if hint:
+            boot_msg = f"{hint} · {boot_msg}"
         _PREVIEW_META.update({
             "running": True,
             "port": port,
             "url": url,
             "characterId": cid,
             "projectPath": str(project_path),
+            "publishDir": str(publish_dir),
             "pid": proc.pid,
             "error": "",
-            "message": "正在启动预览…",
+            "message": boot_msg,
             "logPath": str(log_path),
         })
 
@@ -1595,6 +1657,7 @@ _QUIET_OK_PATH_PREFIXES = (
     "/api/card/list",
     "/api/card/cloud",
     "/api/status",
+    "/api/origin",
     "/api/preview",
     "/api/bridge",
     "/api/ping",
@@ -1636,6 +1699,9 @@ class Handler(BaseHTTPRequestHandler):
             payload["sync"] = sync_job_snapshot()
             payload["preview"] = preview_snapshot()
             _json(self, 200, payload)
+            return
+        if path == "/api/origin":
+            _json(self, 200, do_origin_get())
             return
         if path == "/api/ping":
             _json(self, 200, do_ping_editor())
@@ -1758,6 +1824,10 @@ class Handler(BaseHTTPRequestHandler):
         body = _read_body(self)
         if path == "/api/login":
             result = do_login(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/origin":
+            result = do_origin_set(body)
             _json(self, 200 if result.get("ok") else 400, result)
             return
         if path == "/api/config":
@@ -1885,7 +1955,8 @@ def _try_auto_preview() -> None:
             print("[console] 自动预览跳过：尚未登录（网页登录后可手动启动预览）")
             return
         if not status.get("publishIndexExists"):
-            print("[console] 自动预览跳过：本地尚无 publish/index.html")
+            detail = status.get("projectResolveError") or "本地尚无可预览的 index.html"
+            print(f"[console] 自动预览跳过：{detail.splitlines()[0]}")
             return
         print("[console] 自动启动游戏预览…")
         result = do_start_preview({})

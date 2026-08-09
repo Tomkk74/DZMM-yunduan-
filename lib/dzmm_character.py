@@ -46,7 +46,6 @@ KIT_ROOT = Path(__file__).resolve().parents[1]
 CARDS_DIR = KIT_ROOT / "卡"
 TEMPLATE_DIR = KIT_ROOT / "_模板"
 CHAT_PROMPT_PATH = TEMPLATE_DIR / "开聊提示词.txt"
-ORIGIN = studio.ORIGIN
 
 
 def build_chat_prompt(name: str = "", brief: str = "") -> dict:
@@ -1001,7 +1000,7 @@ def _trpc_get(path: str, payload: dict | None = None) -> dict:
     cookie, token, _, _ = studio.load_auth(min_remain=30)
     payload = payload or {}
     q = urllib.parse.quote(json.dumps({"0": {"json": payload}}, separators=(",", ":")))
-    url = f"{ORIGIN}/api/trpc/{path}?batch=1&input={q}"
+    url = f"{studio.get_origin()}/api/trpc/{path}?batch=1&input={q}"
     st, raw, _ = studio.http(url, cookie, token, method="GET", timeout=45, accept="application/json")
     obj = json.loads(raw.decode("utf-8", "replace"))
     if st != 200:
@@ -1078,7 +1077,7 @@ def fetch_character_listing_status(card_id: int) -> dict:
         raise ValueError("需要有效 cardId")
     cookie, token, _, _ = studio.load_auth(min_remain=30)
     st, raw, _ = studio.http(
-        f"{ORIGIN}/character/{card_id}",
+        f"{studio.get_origin()}/character/{card_id}",
         cookie,
         token,
         method="GET",
@@ -1687,7 +1686,7 @@ def _trpc_post(path: str, payload: dict) -> dict:
     cookie, token, _, _ = studio.load_auth(min_remain=30)
     body = json.dumps({"0": {"json": payload}}, ensure_ascii=False).encode("utf-8")
     st, raw, _ = studio.http(
-        f"{ORIGIN}/api/trpc/{path}?batch=1",
+        f"{studio.get_origin()}/api/trpc/{path}?batch=1",
         cookie,
         token,
         method="POST",
@@ -1737,7 +1736,7 @@ def upload_character_image(raw: bytes, filename: str = "image.png") -> str:
         ]
     )
     req = urllib.request.Request(
-        f"{ORIGIN}/api/trpc/studio.uploadCharacterImage?batch=1",
+        f"{studio.get_origin()}/api/trpc/studio.uploadCharacterImage?batch=1",
         data=body,
         method="POST",
         headers={
@@ -1745,8 +1744,8 @@ def upload_character_image(raw: bytes, filename: str = "image.png") -> str:
             "Authorization": f"Bearer {token}",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
             "Accept": "application/json",
-            "Origin": ORIGIN,
-            "Referer": f"{ORIGIN}/studio/edit",
+            "Origin": studio.get_origin(),
+            "Referer": f"{studio.get_origin()}/studio/edit",
             "User-Agent": "Mozilla/5.0 DZMM-Studio-Bridge",
         },
     )
@@ -1921,7 +1920,7 @@ def publish_to_cloud(local_id: str, *, as_draft: bool = False) -> dict:
         **saved,
         "mode": "save",
         "cloudId": new_id,
-        "characterUrl": f"{ORIGIN}/character/{new_id}",
+        "characterUrl": f"{studio.get_origin()}/character/{new_id}",
         "result": result,
     }
 
@@ -2003,7 +2002,7 @@ def shelf_cloud_card(card_id: int, *, listed: bool = True, local_id: str | None 
         "remainingToday": result.get("remainingToday"),
         "dailyLimit": result.get("dailyLimit"),
         "result": result,
-        "characterUrl": f"{ORIGIN}/character/{card_id}",
+        "characterUrl": f"{studio.get_origin()}/character/{card_id}",
         "status": status,
     }
     if saved:
@@ -2041,8 +2040,8 @@ def _chat_http(
         "Authorization": f"Bearer {token}",
         "User-Agent": "Mozilla/5.0 DZMM-Local-Card-Play",
         "Accept": accept,
-        "Referer": f"{ORIGIN}/chat",
-        "Origin": ORIGIN,
+        "Referer": f"{studio.get_origin()}/chat",
+        "Origin": studio.get_origin(),
         "x-dzmm-request-id": f"cardplay{int(time.time()) % 10_000_000}",
     }
     body = None
@@ -2317,7 +2316,7 @@ def play_generate_request(body: dict):
     """发起 POST /api/chat，返回 (status, response_or_error, headers)。调用方负责读流。"""
     if not isinstance(body, dict):
         raise ValueError("generate body 必须是对象")
-    url = f"{ORIGIN}/api/chat"
+    url = f"{studio.get_origin()}/api/chat"
     raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
     return _chat_http(
         url,

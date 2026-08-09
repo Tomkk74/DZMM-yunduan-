@@ -1032,6 +1032,11 @@ textarea.mono {
 .btn.accent:hover { background: #222; }
 .btn:disabled { opacity: 0.5; cursor: wait; }
 
+.hint.is-alert {
+  color: var(--bad);
+  font-weight: 600;
+}
+
 .hint {
   margin: 0 0 10px;
   color: var(--muted);

@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>DZMM 本地开发控制台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231a1f24'/%3E%3Ctext x='16' y='22' text-anchor='middle' fill='%23e8e6e3' font-size='14' font-family='Segoe UI,sans-serif'%3ED%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="./app.css">
 </head>
 <body>
@@ -61,6 +62,18 @@
           <h2>账号登录</h2>
           <form id="loginForm" class="form" autocomplete="on">
             <label>
+              <span>平台线路（API 域名）</span>
+              <select id="originSelect" name="origin"></select>
+            </label>
+            <p class="hint">
+              国内访问 <code>www.dzmm.ai</code> 易被拦；可选国内镜像。官方线路页：
+              <a id="addrPageLink" href="https://dzmm-home.github.io/dzmm-addr/" target="_blank" rel="noopener">dzmm-addr</a>
+            </p>
+            <div class="actions" style="margin-bottom:12px">
+              <button type="button" class="btn" id="originProbeBtn">测速并优选</button>
+            </div>
+            <p id="originHint" class="hint" hidden></p>
+            <label>
               <span>邮箱</span>
               <input id="email" name="email" type="email" required placeholder="you@example.com">
             </label>
@@ -87,10 +100,11 @@
               <input id="characterId" name="characterId" type="number" min="1" placeholder="例如 3355944">
             </label>
             <label>
-              <span>本地项目路径（游戏根目录，内含 publish/）</span>
+              <span>本地项目路径</span>
               <input id="projectPath" name="projectPath" type="text" placeholder="D:\path\to\your-game">
             </label>
-            <p class="hint">预览实际打开的是该目录下的 <code>publish/</code>（最终玩家包）。勿直接填到 <code>.../publish</code>。</p>
+            <p class="hint">可填项目根（含 <code>publish/</code>）、<code>publish</code> 本身，或根上直接有 <code>index.html</code> 的玩家包。会自动识别。</p>
+            <p id="projectPathHint" class="hint" hidden></p>
             <label>
               <span>预览端口</span>
               <input id="previewPort" name="previewPort" type="number" min="1024" max="65535" value="8791">
@@ -110,7 +124,7 @@
             <button type="button" class="btn accent" id="pullBtn">开始拉取</button>
             <button type="button" class="btn" id="pullRetryBtn" hidden>重拉失败文件</button>
           </div>
-          <p id="pullRetryHint" class="hint" hidden>仅重新下载上次失败的文件，不会全量重拉。</p>
+          <p id="pullRetryHint" class="hint" hidden>有失败文件时可点「重拉失败文件」只补下失败项，不会全量重拉。</p>
           <div class="progress-wrap">
             <div id="pullBar" class="progress-bar" style="width:0%"></div>
           </div>

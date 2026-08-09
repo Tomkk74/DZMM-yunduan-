@@ -1,5 +1,6 @@
 {
   "character_id": 0,
   "project_path": "D:\\path\\to\\your-game",
-  "preview_port": 8791
+  "preview_port": 8791,
+  "origin": "https://www.aifukk.com"
 }

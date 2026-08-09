@@ -22,15 +22,33 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]  # overwritten by --project-root
+PUBLISH_DIR = ROOT / "publish"  # may equal ROOT for flat player packages
 DEFAULT_CARD_ID = 0
 DEFAULT_PORT = 8791
-ORIGIN = "https://www.dzmm.ai"
+def _origin() -> str:
+    try:
+        mod = load_studio()
+        if hasattr(mod, 'get_origin'):
+            return str(mod.get_origin())
+    except Exception:
+        pass
+    return "https://www.dzmm.ai"
+
+
 DEFAULT_PROJECT_NAME = "DZMM Game"
 
 
-def set_project_root(path: Path | str) -> Path:
-    global ROOT
+def set_project_root(path: Path | str, publish_dir: Path | str | None = None) -> Path:
+    global ROOT, PUBLISH_DIR
     ROOT = Path(path).expanduser().resolve()
+    if publish_dir is not None and str(publish_dir).strip():
+        PUBLISH_DIR = Path(publish_dir).expanduser().resolve()
+    elif (ROOT / "publish" / "index.html").is_file():
+        PUBLISH_DIR = ROOT / "publish"
+    elif (ROOT / "index.html").is_file():
+        PUBLISH_DIR = ROOT
+    else:
+        PUBLISH_DIR = ROOT / "publish"
     return ROOT
 
 BRIDGE_JS = r"""
@@ -229,6 +247,17 @@ BRIDGE_JS = r"""
     },
     fn: {
       async invoke(name, body) {
+        // 本地预览：游戏侧 HarborGuard 若误走 platform 模式，仍给可用票据
+        if (String(name || "") === "harbor_guard") {
+          const method = String((body && body.method) || "issue");
+          const now = Date.now();
+          const ttl = 45 * 60 * 1000;
+          if (method === "ping" && body && body.token) {
+            return { ok: true, token: String(body.token), exp: now + ttl, local: true };
+          }
+          const token = "local-" + now.toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+          return { ok: true, token, exp: now + ttl, ttlMs: ttl, local: true };
+        }
         try {
           const data = await api("/fn/invoke", { method: "POST", body: { name, body: body || {} } });
           // 线上 HTTP 包一层 { result }；SDK 对浏览器直接返回函数返回值
@@ -271,7 +300,7 @@ def load_studio():
 
 
 def _load_project_name() -> str:
-    for path in (ROOT / "template.json", ROOT / "publish" / "template.json"):
+    for path in (ROOT / "template.json", PUBLISH_DIR / "template.json", ROOT / "publish" / "template.json"):
         try:
             if not path.is_file():
                 continue
@@ -359,7 +388,7 @@ class PreviewState:
                     self.game_id = str(self.character_id)
             try:
                 st, raw, _ = self.studio.http(
-                    f"{ORIGIN}/api/gamefy/{self.character_id}/dev-chat",
+                    f"{_origin()}/api/gamefy/{self.character_id}/dev-chat",
                     cookie,
                     token,
                     method="POST",
@@ -374,7 +403,7 @@ class PreviewState:
             try:
                 q = urllib.parse.quote(json.dumps({"0": {"json": {}}}, separators=(",", ":")))
                 st_me, raw_me, _ = self.studio.http(
-                    f"{ORIGIN}/api/trpc/user.getMe?batch=1&input={q}",
+                    f"{_origin()}/api/trpc/user.getMe?batch=1&input={q}",
                     cookie,
                     token,
                     method="GET",
@@ -468,7 +497,7 @@ class PreviewState:
         try:
             q = urllib.parse.quote(json.dumps({"0": {"json": {}}}, separators=(",", ":")))
             st, raw, _ = self.studio.http(
-                f"{ORIGIN}/api/trpc/user.getMe?batch=1&input={q}",
+                f"{_origin()}/api/trpc/user.getMe?batch=1&input={q}",
                 self.cookie,
                 self.token,
                 method="GET",
@@ -517,8 +546,8 @@ class PreviewState:
             "Authorization": f"Bearer {self.token}",
             "User-Agent": "Mozilla/5.0 DZMM-Local-Preview",
             "Accept": accept,
-            "Referer": f"{ORIGIN}/studio/game-creation/workbench?character_id={self.character_id}",
-            "Origin": ORIGIN,
+            "Referer": f"{_origin()}/studio/game-creation/workbench?character_id={self.character_id}",
+            "Origin": _origin(),
         }
         if self.chat_id:
             headers["X-Dzmm-Chat-Id"] = self.chat_id
@@ -695,7 +724,7 @@ def make_handler(state: PreviewState):
                     fn_body = body.get("body") or {}
                     st, raw, hdr = state.upstream(
                         "POST",
-                        f"{ORIGIN}/api/gamefy/{state.character_id}/fn/{urllib.parse.quote(name)}",
+                        f"{_origin()}/api/gamefy/{state.character_id}/fn/{urllib.parse.quote(name)}",
                         body=json.dumps(fn_body).encode("utf-8"),
                         content_type="application/json",
                         accept="application/json",
@@ -716,17 +745,17 @@ def make_handler(state: PreviewState):
                         else:
                             params[k] = v
                     q = urllib.parse.urlencode(params)
-                    url = f"{ORIGIN}/api/gamefy/{state.chat_id}/workshop" + (f"?{q}" if q else "")
+                    url = f"{_origin()}/api/gamefy/{state.chat_id}/workshop" + (f"?{q}" if q else "")
                     return self.proxy_json("GET", url, None)
                 if path == "/_dzmm/workshop/publish":
-                    return self.proxy_json("POST", f"{ORIGIN}/api/gamefy/{state.chat_id}/workshop", body)
+                    return self.proxy_json("POST", f"{_origin()}/api/gamefy/{state.chat_id}/workshop", body)
                 if path == "/_dzmm/workshop/unpublish":
                     item_id = urllib.parse.quote(str(body.get("id") or ""))
-                    return self.proxy_json("DELETE", f"{ORIGIN}/api/gamefy/{state.chat_id}/workshop/{item_id}", None)
+                    return self.proxy_json("DELETE", f"{_origin()}/api/gamefy/{state.chat_id}/workshop/{item_id}", None)
                 if path == "/_dzmm/workshop/like":
                     item_id = urllib.parse.quote(str(body.get("id") or ""))
                     method = "PUT" if body.get("liked") else "DELETE"
-                    return self.proxy_json(method, f"{ORIGIN}/api/gamefy/{state.chat_id}/workshop/{item_id}/like", None)
+                    return self.proxy_json(method, f"{_origin()}/api/gamefy/{state.chat_id}/workshop/{item_id}/like", None)
                 self._send(404, json.dumps({"error": "unknown bridge route"}).encode(), "application/json")
             except Exception as e:
                 self._send(500, json.dumps({"error": str(e)}).encode(), "application/json")
@@ -737,11 +766,17 @@ def make_handler(state: PreviewState):
             if ".." in rel.split("/"):
                 return None
             candidates = [
+                PUBLISH_DIR / rel,
+                PUBLISH_DIR / "static" / rel,
                 ROOT / "publish" / rel,
                 ROOT / "publish" / "static" / rel,
             ]
-            if not rel.startswith("assets/") and (ROOT / "publish" / "assets" / rel).is_file():
-                candidates.insert(0, ROOT / "publish" / "assets" / rel)
+            if not rel.startswith("assets/"):
+                for base in (PUBLISH_DIR, ROOT / "publish"):
+                    asset = base / "assets" / rel
+                    if asset.is_file():
+                        candidates.insert(0, asset)
+                        break
             for path in candidates:
                 try:
                     if path.is_file():
@@ -765,7 +800,7 @@ def make_handler(state: PreviewState):
             local_path = self._local_static_path(rel)
             if local_path is not None:
                 return self._send_file(local_path, self._guess_ctype(local_path))
-            url = f"{ORIGIN}/api/game-studio/proxy/{state.game_id}/static/{rel}"
+            url = f"{_origin()}/api/game-studio/proxy/{state.game_id}/static/{rel}"
             try:
                 st, raw, hdr = state.upstream("GET", url)
             except Exception as e:
@@ -804,7 +839,7 @@ def make_handler(state: PreviewState):
             key = str(key or "").strip()
             if not key or "/" in key or "\\" in key:
                 return self._send(400, json.dumps({"error": "invalid kv key"}).encode(), "application/json")
-            url = f"{ORIGIN}/api/gamefy/{state.chat_id}/kv/{urllib.parse.quote(key, safe='')}"
+            url = f"{_origin()}/api/gamefy/{state.chat_id}/kv/{urllib.parse.quote(key, safe='')}"
             body = None if data is None else json.dumps(data).encode("utf-8")
             try:
                 st, raw, hdr = state.upstream(
@@ -846,7 +881,7 @@ def make_handler(state: PreviewState):
                 payload["chatId"] = state.chat_id
             st, raw, hdr = state.upstream(
                 "POST",
-                f"{ORIGIN}/api/gamefy/completions",
+                f"{_origin()}/api/gamefy/completions",
                 body=json.dumps(payload).encode("utf-8"),
                 content_type="application/json",
                 accept="text/event-stream, application/json",
@@ -859,7 +894,7 @@ def make_handler(state: PreviewState):
             q = urllib.parse.quote(json.dumps({"json": {"service": "gamefy"}}, separators=(",", ":")))
             st, raw, _ = state.upstream(
                 "GET",
-                f"{ORIGIN}/api/trpc/chat.models?input={q}",
+                f"{_origin()}/api/trpc/chat.models?input={q}",
                 accept="application/json",
             )
             if st != 200:
@@ -882,7 +917,7 @@ def make_handler(state: PreviewState):
             kind = kind if kind in ("generate", "edit") else "generate"
             st, raw, _ = state.upstream(
                 "GET",
-                f"{ORIGIN}/api/gamefy/draw/models?kind={urllib.parse.quote(kind)}",
+                f"{_origin()}/api/gamefy/draw/models?kind={urllib.parse.quote(kind)}",
                 accept="application/json",
             )
             if st != 200:
@@ -905,7 +940,7 @@ def make_handler(state: PreviewState):
             if url.startswith("http://") or url.startswith("https://"):
                 return url
             if url.startswith("/"):
-                return ORIGIN + url
+                return _origin() + url
             return url
 
         def proxy_draw_generate(self, body: dict):
@@ -915,7 +950,7 @@ def make_handler(state: PreviewState):
                 payload["chatId"] = state.chat_id
             st, raw, _ = state.upstream(
                 "POST",
-                f"{ORIGIN}/api/gamefy/draw",
+                f"{_origin()}/api/gamefy/draw",
                 body=json.dumps(payload).encode("utf-8"),
                 content_type="application/json",
                 accept="application/json",
@@ -947,7 +982,7 @@ def make_handler(state: PreviewState):
             while time.time() < deadline:
                 st, last_raw, _ = state.upstream(
                     "GET",
-                    f"{ORIGIN}/api/gamefy/draw/status?taskId={urllib.parse.quote(str(task_id))}",
+                    f"{_origin()}/api/gamefy/draw/status?taskId={urllib.parse.quote(str(task_id))}",
                     accept="application/json",
                 )
                 if st == 200:
@@ -997,15 +1032,23 @@ def make_handler(state: PreviewState):
 
         def serve_index(self):
             html = None
-            local_index = ROOT / "publish" / "index.html"
-            if local_index.is_file():
+            local_index = None
+            for cand in (PUBLISH_DIR / "index.html", ROOT / "publish" / "index.html", ROOT / "index.html"):
+                if cand.is_file():
+                    local_index = cand
+                    break
+            if local_index is not None:
                 try:
                     html = local_index.read_text(encoding="utf-8")
-                    print(f"[preview] index from local {local_index.relative_to(ROOT).as_posix()}")
+                    try:
+                        rel = local_index.relative_to(ROOT).as_posix()
+                    except ValueError:
+                        rel = str(local_index)
+                    print(f"[preview] index from local {rel}")
                 except OSError as e:
                     print(f"[preview] local index read fail: {e}")
             if html is None:
-                url = f"{ORIGIN}/api/game-studio/proxy/{state.game_id}/static/index.html"
+                url = f"{_origin()}/api/game-studio/proxy/{state.game_id}/static/index.html"
                 try:
                     st, raw, _ = state.upstream("GET", url)
                 except Exception as e:
@@ -1030,6 +1073,7 @@ def main():
     ap.add_argument("--character-id", type=int, default=DEFAULT_CARD_ID)
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--project-root", type=Path, default=None, help="本地游戏项目根目录（含 publish/）")
+    ap.add_argument("--publish-dir", type=Path, default=None, help="实际玩家包目录（含 index.html）")
     ap.add_argument("--no-open", action="store_true")
     args = ap.parse_args()
 
@@ -1037,20 +1081,29 @@ def main():
     if hasattr(studio_mod, "refresh_root"):
         studio_mod.refresh_root()
     project = args.project_root
+    publish_dir = args.publish_dir
     if project is None and hasattr(studio_mod, "project_root"):
         project = studio_mod.project_root()
     if project is None:
         project = ROOT
-    if hasattr(studio_mod, "normalize_project_root"):
+    if hasattr(studio_mod, "resolve_game_project"):
+        resolved = studio_mod.resolve_game_project(project)
+        if resolved.get("ok"):
+            project = resolved["root"]
+            if publish_dir is None:
+                publish_dir = resolved["publish_dir"]
+        elif hasattr(studio_mod, "normalize_project_root"):
+            project = studio_mod.normalize_project_root(project)
+    elif hasattr(studio_mod, "normalize_project_root"):
         project = studio_mod.normalize_project_root(project)
-    set_project_root(project)
+    set_project_root(project, publish_dir)
     cid = int(args.character_id or 0)
     if not cid and hasattr(studio_mod, "load_config"):
         cid = int(studio_mod.load_config().get("character_id") or 0)
     if not cid:
         raise SystemExit("缺少 character_id")
-    if not (ROOT / "publish" / "index.html").is_file():
-        raise SystemExit(f"缺少 publish/index.html：{ROOT}")
+    if not (PUBLISH_DIR / "index.html").is_file():
+        raise SystemExit(f"缺少 index.html：{PUBLISH_DIR}")
 
     state = PreviewState(cid, port=args.port)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(state))
@@ -1058,6 +1111,7 @@ def main():
     server.daemon_threads = True
     url = f"http://127.0.0.1:{args.port}/"
     print(f"[preview] root={ROOT}")
+    print(f"[preview] publish={PUBLISH_DIR}")
     print(f"[preview] character_id={cid} port={args.port} ready {url}", flush=True)
     if not args.no_open:
         webbrowser.open(url)
