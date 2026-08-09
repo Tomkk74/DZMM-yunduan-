@@ -20,15 +20,17 @@
         </div>
       </div>
 
-      <nav class="menu" aria-label="功能菜单">
-        <p class="menu-group">游戏卡</p>
+      <nav class="mode-switch" aria-label="卡类型切换">
+        <button type="button" class="mode-item active" id="modeGameBtn" data-mode="game">游戏卡</button>
+        <button type="button" class="mode-item" id="modeCardBtn" data-mode="card">角色卡</button>
+      </nav>
+
+      <nav class="menu" id="gameMenu" aria-label="游戏卡菜单">
         <button type="button" class="menu-item active" data-panel="bridge">云端桥接</button>
         <button type="button" class="menu-item" data-panel="login">账号登录</button>
         <button type="button" class="menu-item" data-panel="project">项目配置</button>
         <button type="button" class="menu-item" data-panel="pull">拉取容器</button>
         <button type="button" class="menu-item" data-panel="status">运行状态</button>
-        <p class="menu-group">角色卡</p>
-        <button type="button" class="menu-item" data-panel="card">本地写卡</button>
       </nav>
 
       <div class="sidebar-scroll">
@@ -122,8 +124,10 @@
         </section>
 
         <section class="panel" id="panel-card" data-panel="card" hidden>
-          <h2>本地写卡</h2>
-          <p class="hint">按卡名建文件夹 <code>卡/&lt;卡名&gt;/</code>，编辑其中的 txt 后网页会实时同步。Esc /「菜单」展开侧栏。</p>
+          <h2 class="card-panel-title">
+            本地写卡
+            <span id="cardTokenSummary" class="card-token-summary" title="估算：UTF-8 字节 ÷ 4"><span class="tok-label tok-en">Token</span><span class="tok-num">—</span></span>
+          </h2>
           <label>
             <span>卡名（文件夹名）</span>
             <input id="cardFolderName" type="text" placeholder="例：冷面剑修">
@@ -137,18 +141,12 @@
             <button type="button" class="btn" id="cardNewBtn">新建空白</button>
           </div>
           <div class="actions" style="margin-top:8px">
-            <button type="button" class="btn accent" id="cardPublishBtn2" title="保存为云端正式卡">保存到云端</button>
-            <button type="button" class="btn" id="cardDraftBtn2" title="仅云端草稿">云端草稿</button>
-          </div>
-          <p class="hint"><strong>草稿</strong>可删；<strong>已保存</strong>＝正式卡，未上架可隐藏（删除）；<strong>上架/下架请去官网</strong>。游戏卡不可拉到本地。</p>
-          <div class="actions" style="margin-top:8px">
             <button type="button" class="btn" id="cardRefreshBtn">刷新列表</button>
             <button type="button" class="btn" id="cardCloudBtn">拉取云端列表</button>
           </div>
-          <p id="cardMsg" class="hint" style="margin-top:8px">尚未加载</p>
+          <p id="cardMsg" class="hint" style="margin-top:8px" hidden></p>
           <ul id="cardList" class="card-list"></ul>
           <div id="cloudCardBox" class="cloud-card-box" hidden>
-            <p class="hint">标签：草稿 / 已保存 / 已上架。草稿可删；已保存未上架可隐藏（删除）；上架/下架请去官网。游戏卡不可拉本地。</p>
             <div class="actions" style="margin-bottom:8px">
               <button type="button" class="btn" id="cardCloudFilterAll">全部</button>
               <button type="button" class="btn" id="cardCloudFilterDraft">仅草稿</button>
@@ -205,13 +203,6 @@
             <button type="button" class="btn" id="cardReloadBtn">重载当前</button>
           </div>
         </header>
-        <div id="cardTokenBar" class="card-token-bar" title="估算口径：UTF-8 字节 ÷ 4（近似 GPT / SillyTavern guesstimate），非精确 tokenizer">
-          <div class="card-token-main">
-            <span class="card-token-label">Token</span>
-            <span id="cardTokenSummary" class="card-token-summary">—</span>
-          </div>
-          <div id="cardTokenDetail" class="card-token-detail">编辑卡内容时实时估算</div>
-        </div>
         <div class="card-editor">
           <form id="cardForm" class="card-form">
             <nav class="card-tabs" aria-label="写卡分类">

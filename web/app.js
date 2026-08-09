@@ -6,6 +6,9 @@
   var bridgeTimer = null;
   var publishTimer = null;
   var SIDEBAR_KEY = 'dzmm-console-sidebar-collapsed';
+  var CONSOLE_MODE_KEY = 'dzmm-console-mode';
+  var consoleMode = 'game'; // game | card
+  var lastGamePanel = 'bridge';
   var FAB_POS_KEY = 'dzmm-console-fab-pos';
   var FAB_CIRC = 2 * Math.PI * 20; // r=20
   var currentCardId = '';
@@ -48,7 +51,7 @@
   function setBusy(busy, opts) {
     opts = opts || {};
     var keep = opts.keepEnabled || {};
-    ['loginBtn', 'logoutBtn', 'pingBtn', 'pullBtn', 'pullRetryBtn', 'previewStartBtn', 'previewStopBtn', 'previewReloadBtn', 'publishBtn', 'bridgeRefreshBtn', 'fabPublish', 'fabReload', 'fabSync', 'fabExpand', 'cardAiBtn', 'cardAiBtn2', 'cardNewBtn', 'cardNewBtn2', 'cardSaveBtn', 'cardRefreshBtn', 'cardCloudBtn', 'cardReloadBtn', 'cardMenuBtn', 'cardVoiceRefreshBtn', 'cardVoiceClearBtn', 'cardPublishBtn', 'cardPublishBtn2', 'cardDraftBtn', 'cardDraftBtn2', 'cardDeleteLocalBtn', 'cardCloudFilterAll', 'cardCloudFilterDraft', 'cardCloudFilterPub'].forEach(function (id) {
+    ['loginBtn', 'logoutBtn', 'pingBtn', 'pullBtn', 'pullRetryBtn', 'previewStartBtn', 'previewStopBtn', 'previewReloadBtn', 'publishBtn', 'bridgeRefreshBtn', 'fabPublish', 'fabReload', 'fabSync', 'fabExpand', 'cardAiBtn', 'cardAiBtn2', 'cardNewBtn', 'cardNewBtn2', 'cardSaveBtn', 'cardRefreshBtn', 'cardCloudBtn', 'cardReloadBtn', 'cardMenuBtn', 'cardVoiceRefreshBtn', 'cardVoiceClearBtn', 'cardPublishBtn', 'cardDraftBtn', 'cardDeleteLocalBtn', 'cardCloudFilterAll', 'cardCloudFilterDraft', 'cardCloudFilterPub'].forEach(function (id) {
       var el = $(id);
       if (!el) return;
       if (busy && keep[id]) {
@@ -354,7 +357,17 @@
     }
   }
 
-  function switchPanel(name) {
+  function switchPanel(name, opts) {
+    opts = opts || {};
+    if (!name) return;
+    if (name === 'card') {
+      if (consoleMode !== 'card') {
+        switchConsoleMode('card', { skipPanel: true });
+      }
+    } else if (consoleMode !== 'game') {
+      switchConsoleMode('game', { skipPanel: true, panel: name });
+    }
+
     document.querySelectorAll('.menu-item').forEach(function (btn) {
       btn.classList.toggle('active', btn.getAttribute('data-panel') === name);
     });
@@ -364,19 +377,43 @@
       if (match) panel.removeAttribute('hidden');
       else panel.setAttribute('hidden', '');
     });
+
     if (name === 'card') {
       setStageMode('card');
-      setCardFullscreen(true);
+      // 切到角色卡：侧栏直接是本地写卡；打开具体卡时再全屏
+      if (opts.fullscreen) setCardFullscreen(true);
+      else setCardFullscreen(false);
       refreshCardList();
-      // 同步侧栏简述到全屏编辑区
       if ($('cardBrief') && $('cardBriefMain') && !$('cardBriefMain').value) {
         $('cardBriefMain').value = $('cardBrief').value || '';
       }
       if (currentCardId) startCardPoll();
     } else {
+      lastGamePanel = name;
       stopCardPoll();
       setStageMode('game');
       setCardFullscreen(false);
+    }
+  }
+
+  function switchConsoleMode(mode, opts) {
+    opts = opts || {};
+    mode = mode === 'card' ? 'card' : 'game';
+    consoleMode = mode;
+    try { localStorage.setItem(CONSOLE_MODE_KEY, mode); } catch (_) {}
+
+    document.querySelectorAll('.mode-item').forEach(function (btn) {
+      btn.classList.toggle('active', btn.getAttribute('data-mode') === mode);
+    });
+    var sidebar = $('sidebar');
+    if (sidebar) sidebar.classList.toggle('is-card-console', mode === 'card');
+
+    if (opts.skipPanel) return;
+
+    if (mode === 'card') {
+      switchPanel('card', { fullscreen: false });
+    } else {
+      switchPanel(opts.panel || lastGamePanel || 'bridge');
     }
   }
 
@@ -835,31 +872,40 @@
     return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   }
 
+  function tokPairHtml(label, num, en) {
+    return '<span class="tok-label' + (en ? ' tok-en' : '') + '">' + label + '</span>' +
+      '<span class="tok-num">' + formatTok(num) + '</span>';
+  }
+
   function updateCardTokenStats() {
-    var bar = $('cardTokenBar');
     var summary = $('cardTokenSummary');
-    var detail = $('cardTokenDetail');
-    if (!summary || !detail) return;
+    if (!summary) return;
     var card;
     try {
       card = collectCardFromForm();
     } catch (_) {
-      summary.textContent = '—';
-      detail.textContent = '无法统计';
+      summary.innerHTML = '<span class="tok-label tok-en">Token</span><span class="tok-num">—</span>';
+      summary.removeAttribute('title');
+      summary.classList.remove('warn', 'hot');
       return;
     }
     var st = computeCardTokenStats(card);
-    summary.textContent =
-      '卡定义 ' + formatTok(st.cardDef) +
-      ' · 常驻发送 ' + formatTok(st.chatPermanent) +
-      ' · 首轮约 ' + formatTok(st.chatFirstRound);
+    summary.innerHTML =
+      tokPairHtml('Token', st.cardDef, true) +
+      '<span class="tok-sep">·</span>' +
+      tokPairHtml('常驻', st.chatPermanent, false) +
+      '<span class="tok-sep">·</span>' +
+      tokPairHtml('首轮', st.chatFirstRound, false);
     summary.classList.remove('warn', 'hot');
     if (st.chatPermanent >= 3000 || st.cardDef >= 4000) summary.classList.add('hot');
     else if (st.chatPermanent >= 1800 || st.cardDef >= 2500) summary.classList.add('warn');
 
     var b = st.breakdown;
-    detail.textContent =
-      '基础 简介' + formatTok(b.description) +
+    summary.title =
+      '卡定义 ' + formatTok(st.cardDef) +
+      ' · 常驻发送 ' + formatTok(st.chatPermanent) +
+      ' · 首轮约 ' + formatTok(st.chatFirstRound) +
+      '\n简介' + formatTok(b.description) +
       ' / 性格' + formatTok(b.personality) +
       ' / 场景' + formatTok(b.scenario) +
       ' / 系统' + formatTok(b.system_prompt) +
@@ -868,12 +914,7 @@
       '（' + st.wbConstantCount + '）' +
       ' / 条件≤' + formatTok(st.wbConditional) +
       '（' + st.wbConditionalCount + '）' +
-      ' · 估算 UTF-8÷4';
-    if (bar) {
-      bar.title =
-        '卡定义=写入卡内的全部文案估算；常驻发送≈每轮聊天都会带上的人设+常驻世界书；' +
-        '首轮≈常驻+开场+条件世界书全触发上限。实际平台 tokenizer 可能略有偏差。';
-    }
+      '\n估算 UTF-8÷4；卡定义=卡内全文；常驻≈人设+常驻世界书；首轮≈常驻+开场+条件世界书上限';
   }
 
   function updateCardPreview() {
@@ -897,6 +938,8 @@
     if (!el) return;
     el.textContent = text || '';
     el.style.color = ok === false ? 'var(--bad)' : '';
+    if (text) el.removeAttribute('hidden');
+    else el.setAttribute('hidden', '');
   }
 
   async function deleteLocalCard(localId) {
@@ -919,8 +962,11 @@
         currentCardMtime = 0;
         stopCardPoll();
         if ($('cardStageMeta')) $('cardStageMeta').textContent = '未打开卡';
-        if ($('cardTokenSummary')) $('cardTokenSummary').textContent = '—';
-        if ($('cardTokenDetail')) $('cardTokenDetail').textContent = '编辑卡内容时实时估算';
+        if ($('cardTokenSummary')) {
+          $('cardTokenSummary').innerHTML =
+            '<span class="tok-label tok-en">Token</span><span class="tok-num">—</span>';
+          $('cardTokenSummary').classList.remove('warn', 'hot');
+        }
       }
       await refreshCardList();
       showMsg('已删除本地卡 · ' + localId, true);
@@ -1042,6 +1088,10 @@
       it.isListed = isListed;
       it.isPendingReview = isPending;
       var li = document.createElement('li');
+      if (it.isDraft) li.className = 'card-tone-draft';
+      else if (isListed) li.className = 'card-tone-listed';
+      else if (isPending) li.className = 'card-tone-pending';
+      else li.className = 'card-tone-saved';
       var statusNodes = [];
       if (it.isDraft) {
         statusNodes.push(makeBadge('badge-draft', '草稿', '云端草稿，可删除'));
@@ -1150,15 +1200,22 @@
       items.forEach(function (it) {
         var li = document.createElement('li');
         var statusNodes = [];
+        var isPending = !!(it.isPendingReview || it.publishStatus === 'pending' || it.publishStatus === 'pending_notified');
+        var isSaved = !!(it.published || (it.cloudId && Number(it.cloudId) > 0));
         if (it.isListed) {
+          li.className = 'card-tone-listed';
           statusNodes.push(makeBadge('badge-listed', '上架到广场', '已上架 · #' + it.cloudId));
-        } else if (it.isPendingReview || it.publishStatus === 'pending' || it.publishStatus === 'pending_notified') {
+        } else if (isPending) {
+          li.className = 'card-tone-pending';
           statusNodes.push(makeBadge('badge-pending', '审核中', '已提交上架 · #' + it.cloudId));
-        } else if (it.published || (it.cloudId && Number(it.cloudId) > 0)) {
+        } else if (isSaved) {
+          li.className = 'card-tone-saved';
           statusNodes.push(makeBadge('badge-saved', '已保存', '正式卡 · #' + it.cloudId + ' · 上架请去官网'));
         } else if (it.draftId) {
+          li.className = 'card-tone-draft';
           statusNodes.push(makeBadge('badge-draft', '草稿', 'draftId · ' + it.draftId));
         } else {
+          li.className = 'card-tone-local';
           statusNodes.push(makeBadge('badge-draft', '本地', '尚未同步云端'));
         }
         var sub = '本地 · ' + it.localId;
@@ -1820,6 +1877,11 @@
     startPullRequest('/api/pull/retry', '正在重试失败文件…');
   });
 
+  document.querySelectorAll('.mode-item').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      switchConsoleMode(btn.getAttribute('data-mode'));
+    });
+  });
   document.querySelectorAll('.menu-item').forEach(function (btn) {
     btn.addEventListener('click', function () {
       switchPanel(btn.getAttribute('data-panel'));
@@ -2264,9 +2326,7 @@
   }
 
   if ($('cardPublishBtn')) $('cardPublishBtn').addEventListener('click', function () { saveToCloud(false); });
-  if ($('cardPublishBtn2')) $('cardPublishBtn2').addEventListener('click', function () { saveToCloud(false); });
   if ($('cardDraftBtn')) $('cardDraftBtn').addEventListener('click', function () { saveToCloud(true); });
-  if ($('cardDraftBtn2')) $('cardDraftBtn2').addEventListener('click', function () { saveToCloud(true); });
   if ($('cardDeleteLocalBtn')) {
     $('cardDeleteLocalBtn').addEventListener('click', function () {
       var id = currentCardLocalId();
@@ -2322,6 +2382,13 @@
   }
   setFabProgress(0, 'idle');
 
+  try {
+    var savedMode = localStorage.getItem(CONSOLE_MODE_KEY);
+    if (savedMode === 'card' || savedMode === 'game') {
+      switchConsoleMode(savedMode);
+    }
+  } catch (_) {}
+
   document.addEventListener('keydown', function (ev) {
     if (ev.key === 'Escape' && isSidebarCollapsed()) {
       setSidebarCollapsed(false);
@@ -2332,6 +2399,7 @@
     if (status && status.pull && status.pull.running) {
       setBusy(true);
       startPullPoll();
+      switchConsoleMode('game', { skipPanel: true });
       switchPanel('pull');
     }
     if (status && status.sync && status.sync.running) {

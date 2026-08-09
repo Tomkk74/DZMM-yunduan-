@@ -76,10 +76,18 @@ html, body {
 /* —— 左侧菜单 —— */
 .sidebar {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
   min-height: 0;
   border-right: 3px solid var(--ink);
   background: var(--panel);
+}
+
+.sidebar.is-card-console {
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+}
+
+.sidebar.is-card-console #gameMenu {
+  display: none;
 }
 
 .brand {
@@ -118,27 +126,50 @@ html, body {
   color: #fff;
 }
 
+.mode-switch {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  border-bottom: 2px solid var(--ink);
+}
+
+.mode-item {
+  appearance: none;
+  min-height: 28px;
+  padding: 6px 8px;
+  border: 0;
+  border-right: 1px solid var(--ink);
+  background: #f3f3f3;
+  color: var(--ink);
+  font: 700 12px/1 var(--font);
+  cursor: pointer;
+}
+
+.mode-item:last-child {
+  border-right: 0;
+}
+
+.mode-item:hover {
+  background: #e8e8e8;
+}
+
+.mode-item.active {
+  color: var(--ink);
+  /* 密集黑点高亮 */
+  background-color: #d8d8d8;
+  background-image: radial-gradient(circle, #111 0.9px, transparent 1px);
+  background-size: 3px 3px;
+  background-position: 0 0;
+  box-shadow: inset 0 0 0 1px rgb(0 0 0 / 35%);
+  font-weight: 800;
+}
+
 .menu {
   display: grid;
   grid-template-columns: 1fr 1fr;
   border-bottom: 2px solid var(--ink);
 }
 
-.menu-group {
-  grid-column: 1 / -1;
-  margin: 0;
-  padding: 8px 10px 4px;
-  border-right: 0;
-  border-bottom: 1px solid var(--ink);
-  background: #ececec;
-  color: var(--muted);
-  font: 700 10px/1 var(--mono);
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-}
-
-.menu-item[data-panel="status"],
-.menu-item[data-panel="card"] {
+.menu-item[data-panel="status"] {
   grid-column: 1 / -1;
   border-right: 0;
 }
@@ -233,6 +264,11 @@ html, body {
   color: #fff;
 }
 
+/* 游戏卡二级菜单：状态占满一行时去掉右线 */
+#gameMenu .menu-item:last-child {
+  border-right: 0;
+}
+
 .sidebar-scroll {
   min-height: 0;
   overflow: auto;
@@ -315,7 +351,27 @@ textarea:focus {
   align-items: start;
   padding: 8px;
   border: 2px solid var(--ink);
-  background: #f7f7f7;
+  background: #fff; /* 本地默认 */
+}
+
+.card-list li.card-tone-local {
+  background: #fff;
+}
+
+.card-list li.card-tone-draft {
+  background: #ffe08a; /* 草稿 · 金黄 */
+}
+
+.card-list li.card-tone-saved {
+  background: #c9ddff; /* 已保存 · 蓝 */
+}
+
+.card-list li.card-tone-listed {
+  background: #9fe3b0; /* 已上架 · 绿 */
+}
+
+.card-list li.card-tone-pending {
+  background: #dce8f8; /* 审核中 · 偏蓝 */
 }
 
 .card-list .card-item-actions {
@@ -420,47 +476,70 @@ textarea:focus {
   min-height: 0;
 }
 
-.card-token-bar {
-  flex: 0 0 auto;
-  display: grid;
-  gap: 4px;
-  padding: 8px 14px;
-  border-bottom: 2px solid var(--ink);
-  background: #fffef6;
-}
-
-.card-token-main {
+.card-panel-title {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
-  gap: 8px 12px;
+  gap: 8px 10px;
 }
 
-.card-token-label {
-  font: 800 11px/1 var(--mono);
-  letter-spacing: 0.04em;
+.card-panel-title .card-token-summary {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 0;
+  font: 600 11px/1.35 var(--mono);
   color: var(--muted);
+}
+
+.card-token-summary .tok-sep {
+  margin: 0 6px;
+  color: #9a9a9a;
+  font-weight: 600;
+  font-size: 10px;
+}
+
+/* 条目名：加粗发光蓝；字母略小、数字更大 */
+.card-token-summary .tok-label {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  color: #3b82f6;
+  text-shadow:
+    0 0 4px rgb(59 130 246 / 85%),
+    0 0 10px rgb(59 130 246 / 45%);
+}
+
+.card-token-summary .tok-label.tok-en {
+  font-size: 9px;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
-.card-token-summary {
-  font: 800 13px/1.3 var(--mono);
-  color: var(--ink);
+.card-token-summary .tok-num {
+  margin-left: 3px;
+  font-size: 13px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  color: #22c55e;
+  text-shadow:
+    0 0 5px rgb(34 197 94 / 90%),
+    0 0 12px rgb(34 197 94 / 55%);
 }
 
-.card-token-summary.warn {
-  color: #8a4b00;
+.card-token-summary.warn .tok-num {
+  color: #eab308;
+  text-shadow:
+    0 0 5px rgb(234 179 8 / 85%),
+    0 0 12px rgb(234 179 8 / 45%);
 }
 
-.card-token-summary.hot {
-  color: var(--bad);
-}
-
-.card-token-detail {
-  font: 600 11px/1.4 var(--mono);
-  color: var(--muted);
-  white-space: normal;
-  word-break: break-word;
+.card-token-summary.hot .tok-num {
+  color: #f87171;
+  text-shadow:
+    0 0 5px rgb(248 113 113 / 90%),
+    0 0 12px rgb(248 113 113 / 50%);
 }
 
 .card-editor {
