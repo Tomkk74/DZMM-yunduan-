@@ -2105,6 +2105,15 @@ def play_start(card_id: int, chat_history_index: int | None = None) -> dict:
     return {"chatId": str(chat_id), "cardId": card_id}
 
 
+def play_delete_chat(chat_id: str) -> dict:
+    """删除平台会话。官网聊天列表：tRPC chat.deleteChat { chatId }。"""
+    chat_id = str(chat_id or "").strip()
+    if not chat_id:
+        raise ValueError("缺少 chatId")
+    result = _trpc_post("chat.deleteChat", {"chatId": chat_id})
+    return {"chatId": chat_id, "result": result}
+
+
 def play_models() -> dict:
     """角色聊天模型列表（service=chat）。"""
     data = _trpc_get("chat.models", {"service": "chat"})

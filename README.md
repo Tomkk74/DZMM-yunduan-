@@ -38,6 +38,8 @@
 
 ### 启动
 
+双击或命令行运行**一个入口**即可（会清理旧端口、启动控制台；已登录且本地有 `publish/index.html` 时自动起预览）：
+
 ```bat
 git clone https://github.com/Tomkk74/DZMM-yunduan-.git
 cd DZMM-yunduan-
@@ -47,10 +49,11 @@ start.bat
 或：
 
 ```bat
-python console.py --port 8788
+python start.py
 ```
 
-浏览器打开：`http://127.0.0.1:8788/`（加 `--no-open` 可禁止自动弹窗）
+浏览器打开：`http://127.0.0.1:8788/`  
+常用参数：`--no-open` 不弹窗、`--no-preview` 只开控制台、`--no-kill` 不清理占用端口的旧进程。
 
 凭据写在本机 `.env`，**不会**上传到本仓库。也可在网页「账号登录」里勾选「保存密码到本机」。
 
@@ -155,7 +158,7 @@ Agent 入口：[`AGENTS.md`](AGENTS.md) → [`_模板/AGENTS.md`](_模板/AGENTS
 
 | 脚本 | 作用 |
 |:---|:---|
-| `start.bat` | 打开 Web 控制台 |
+| `start.bat` / `start.py` | 一键启动（清端口 + 控制台 + 可选预览） |
 | `status.bat` | 配置 / 登录态 |
 | `pull.bat` | 拉取游戏容器 |
 | `sync.bat` | 同步本地到容器 |
@@ -174,8 +177,9 @@ python lib\dzmm_studio.py sync --character-id <CHARACTER_ID> --message "sync"
 
 ```text
 .
-├── console.py                 # Web 控制台入口
-├── start.bat / sync.bat …     # 快捷脚本
+├── start.py / start.bat       # 一键启动入口
+├── console.py                 # Web 控制台服务
+├── sync.bat / pull.bat …      # 可选命令行快捷脚本
 ├── web/                       # 控制台前端（游戏卡 + 角色卡 / 试玩）
 ├── lib/
 │   ├── dzmm_studio.py         # 登录、续期、游戏卡 sync / publish

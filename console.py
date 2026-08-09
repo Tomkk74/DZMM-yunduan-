@@ -881,6 +881,18 @@ def do_card_play_meta(card_id: int) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+def do_card_play_delete(body: dict) -> dict:
+    """删除试玩会话：tRPC chat.deleteChat。"""
+    try:
+        chat_id = str((body or {}).get("chatId") or "").strip()
+        if not chat_id:
+            return {"ok": False, "error": "缺少 chatId"}
+        data = character.play_delete_chat(chat_id)
+        return {"ok": True, **data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def do_card_play_start(body: dict) -> dict:
     try:
         card_id = int(body.get("cardId") or 0)
@@ -1577,11 +1589,36 @@ def do_start_preview(body: dict) -> dict:
     }
 
 
+# 高频成功请求不刷终端；非 2xx 仍打印
+_QUIET_OK_PATH_PREFIXES = (
+    "/api/card/poll",
+    "/api/card/list",
+    "/api/card/cloud",
+    "/api/status",
+    "/api/preview",
+    "/api/bridge",
+    "/api/ping",
+    "/api/pull",
+    "/api/sync",
+)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "DZMM-LocalDev/1.0"
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("[console] " + (fmt % args) + "\n")
+        try:
+            msg = fmt % args
+        except Exception:
+            msg = str(fmt)
+        path = (getattr(self, "path", None) or "").split("?", 1)[0]
+        # BaseHTTPRequestHandler 典型格式: "GET /path HTTP/1.1" 200 -
+        ok = (" 200 " in f" {msg} ") or msg.rstrip().endswith(" 200 -")
+        if ok and any(path == p or path.startswith(p + "/") for p in _QUIET_OK_PATH_PREFIXES):
+            return
+        if ok and (path.startswith("/assets/") or path.endswith((".js", ".css", ".ico", ".png", ".svg", ".woff2"))):
+            return
+        sys.stderr.write("[console] " + msg + "\n")
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -1805,6 +1842,10 @@ class Handler(BaseHTTPRequestHandler):
             result = do_card_play_start(body)
             _json(self, 200 if result.get("ok") else 400, result)
             return
+        if path == "/api/card/play/delete":
+            result = do_card_play_delete(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
         if path == "/api/card/play/settings":
             result = do_card_play_settings_update(body)
             _json(self, 200 if result.get("ok") else 400, result)
@@ -1835,10 +1876,37 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+def _try_auto_preview() -> None:
+    """登录且本地 publish 就绪时自动拉起预览（供 start.py --auto-preview）。"""
+    time.sleep(0.35)
+    try:
+        status = build_status()
+        if not status.get("loggedIn"):
+            print("[console] 自动预览跳过：尚未登录（网页登录后可手动启动预览）")
+            return
+        if not status.get("publishIndexExists"):
+            print("[console] 自动预览跳过：本地尚无 publish/index.html")
+            return
+        print("[console] 自动启动游戏预览…")
+        result = do_start_preview({})
+        if result.get("ok"):
+            snap = result.get("preview") or {}
+            print(f"[console] 预览已就绪 {snap.get('url') or ''}".rstrip())
+        else:
+            print(f"[console] 自动预览失败：{result.get('error') or 'unknown'}")
+    except Exception as e:
+        print(f"[console] 自动预览异常：{e}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="DZMM local dev web console")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--no-open", action="store_true")
+    ap.add_argument(
+        "--auto-preview",
+        action="store_true",
+        help="启动后若已登录且项目就绪则自动打开本地预览",
+    )
     args = ap.parse_args()
 
     studio.refresh_root()
@@ -1849,10 +1917,21 @@ def main():
     print("[console] 在网页填写邮箱/密码/character_id 后登录即可")
     if not args.no_open:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+    if args.auto_preview:
+        threading.Thread(target=_try_auto_preview, name="auto-preview", daemon=True).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n[console] stopped")
+    finally:
+        try:
+            do_stop_preview()
+        except Exception:
+            pass
+        try:
+            httpd.server_close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

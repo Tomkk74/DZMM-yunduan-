@@ -74,6 +74,7 @@ POST /api/trpc/<procedure>?batch=1   body: {"0":{"json":{...}}}
 | 能力 | 调用 |
 | --- | --- |
 | 建会话 | tRPC `chat.createByCard` `{ cardId, fixedRandomIndex?, entryPoint }` → `{ chatId }`；`entryPoint` 须为平台枚举（本地用 `quick_chat`） |
+| 删会话 | tRPC `chat.deleteChat` `{ chatId }`（官网聊天列表右键删除；控制台「返回写卡」会调） |
 | 卡摘要 | tRPC `card.getForChat` / `card.getQuickChatPreview` |
 | 模型列表 | tRPC `chat.models` `{ service: "chat" }` → `categories[].modelGroups[].contexts[]`（`internalName`） |
 | 账号预设 | tRPC `preset.list` → `{ presets, settings.activePresetIds, settings.playerInfo }` |
@@ -113,6 +114,7 @@ SSE 行格式：`data: {"type":"init|token|step|complete|error","data":…}`
 | --- | --- | --- |
 | GET | `/api/card/play/meta?cardId=` | 摘要 + 开场预览 |
 | POST | `/api/card/play/start` | `{ cardId, chatHistoryIndex? }` → `chatId` + 首轮消息 |
+| POST | `/api/card/play/delete` | `{ chatId }` → tRPC `chat.deleteChat`；「返回写卡」自动调用 |
 | GET | `/api/card/play/models` | 聊天模型 |
 | GET | `/api/card/play/presets` | 账号预设 + `displayName`（`user.getMe.fullName`，开场 `{{user}}` 用） |
 | GET | `/api/card/play/messages?chatId=` | 拉历史 |

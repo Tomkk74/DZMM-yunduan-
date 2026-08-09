@@ -881,7 +881,7 @@
     updatePlayGate();
     // 换卡时退出试玩会话
     if (cardPlayMode && playState.cardId && playState.cardId !== currentCloudCardId()) {
-      exitCardPlay({ keepPanel: false });
+      void exitCardPlay({ keepPanel: false, deleteChat: true });
     }
   }
 
@@ -2857,13 +2857,32 @@
     updatePlayGate();
   }
 
-  function exitCardPlay(opts) {
+  async function exitCardPlay(opts) {
     opts = opts || {};
-    if (!opts.keepSession) {
+    var chatId = playState.chatId || '';
+    // 返回写卡 / 结束试玩：默认调平台 chat.deleteChat 删掉本次会话
+    var doDelete = !!chatId && (opts.deleteChat === true || (!opts.keepSession && opts.deleteChat !== false));
+    if (doDelete) {
+      try {
+        var del = await api('/api/card/play/delete', {
+          method: 'POST',
+          body: JSON.stringify({ chatId: chatId }),
+        });
+        if (del && del.ok) {
+          showMsg('已删除试玩会话', true);
+        } else {
+          showMsg((del && del.error) || '删除试玩会话失败（仍返回写卡）', false);
+        }
+      } catch (e) {
+        showMsg(String(e.message || e) || '删除试玩会话失败（仍返回写卡）', false);
+      }
+    }
+    if (!opts.keepSession || doDelete) {
       playState.chatId = '';
       playState.messages = [];
       playState.sending = false;
       playState.charName = '';
+      if ($('playMessages')) $('playMessages').innerHTML = '';
     }
     if (!opts.keepPanel) setCardPlayMode(false);
     if ($('playStatus')) $('playStatus').textContent = playState.chatId ? ('会话 ' + playState.chatId.slice(0, 8) + '…') : '未开始';
@@ -3623,7 +3642,7 @@
   if ($('cardPlayBtn')) $('cardPlayBtn').addEventListener('click', enterCardPlay);
   if ($('cardPlayBackBtn')) {
     $('cardPlayBackBtn').addEventListener('click', function () {
-      exitCardPlay({ keepSession: true });
+      void exitCardPlay({ keepSession: false, keepPanel: false, deleteChat: true });
     });
   }
   if ($('playModelSelect')) {
