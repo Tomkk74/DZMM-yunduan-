@@ -85,7 +85,7 @@
   function setBusy(busy, opts) {
     opts = opts || {};
     var keep = opts.keepEnabled || {};
-    ['loginBtn', 'logoutBtn', 'pingBtn', 'pullBtn', 'pullRetryBtn', 'previewStartBtn', 'previewStopBtn', 'previewReloadBtn', 'publishBtn', 'bridgeRefreshBtn', 'fabPublish', 'fabReload', 'fabSync', 'fabExpand', 'cardAiBtn', 'cardAiBtn2', 'cardCopyPromptBtn', 'cardCopyPromptBtn2', 'cardNewBtn2', 'cardSaveBtn', 'cardExportPngBtn', 'cardRefreshBtn', 'cardCloudBtn', 'cardReloadBtn', 'cardMenuBtn', 'cardVoiceRefreshBtn', 'cardVoiceClearBtn', 'cardPublishBtn', 'cardDraftBtn', 'cardDeleteLocalBtn', 'cardCloudFilterAll', 'cardCloudFilterDraft', 'cardCloudFilterPub', 'cardCloudSearch'].forEach(function (id) {
+    ['loginBtn', 'logoutBtn', 'pingBtn', 'pullBtn', 'pullRetryBtn', 'previewStartBtn', 'previewStopBtn', 'previewReloadBtn', 'publishBtn', 'bridgeRefreshBtn', 'fabPublish', 'fabReload', 'fabSync', 'fabExpand', 'cardAiBtn', 'cardCopyPromptBtn', 'cardNewBtn2', 'cardSaveBtn', 'cardExportPngBtn', 'cardRefreshBtn', 'cardCloudBtn', 'cardReloadBtn', 'cardMenuBtn', 'cardVoiceRefreshBtn', 'cardVoiceClearBtn', 'cardPublishBtn', 'cardDraftBtn', 'cardCloudFilterAll', 'cardCloudFilterDraft', 'cardCloudFilterPub', 'cardCloudSearch'].forEach(function (id) {
       var el = $(id);
       if (!el) return;
       if (busy && keep[id]) {
@@ -2520,9 +2520,7 @@
   }
 
   if ($('cardAiBtn')) $('cardAiBtn').addEventListener('click', runCardAiWrite);
-  if ($('cardAiBtn2')) $('cardAiBtn2').addEventListener('click', runCardAiWrite);
   if ($('cardCopyPromptBtn')) $('cardCopyPromptBtn').addEventListener('click', function () { runCopyChatPrompt(); });
-  if ($('cardCopyPromptBtn2')) $('cardCopyPromptBtn2').addEventListener('click', function () { runCopyChatPrompt(); });
   if ($('cardNewBtn2')) $('cardNewBtn2').addEventListener('click', runCardNew);
   if ($('cardMenuBtn')) {
     $('cardMenuBtn').addEventListener('click', function () {
@@ -2673,8 +2671,17 @@
       if (!cardPlayMode) $('cardForm').style.removeProperty('display');
     }
     if ($('cardPlayPanel')) $('cardPlayPanel').hidden = !cardPlayMode;
-    if ($('cardPlayBtn')) $('cardPlayBtn').hidden = cardPlayMode;
-    if ($('cardPlayBackBtn')) $('cardPlayBackBtn').hidden = !cardPlayMode;
+    // 试玩时顶部只保留菜单 + 返回写卡；写卡界面绝不显示返回写卡
+    ['cardNewBtn2', 'cardSaveBtn', 'cardExportPngBtn', 'cardPublishBtn', 'cardDraftBtn', 'cardPlayBtn', 'cardReloadBtn'].forEach(function (id) {
+      var el = $(id);
+      if (!el) return;
+      if (cardPlayMode) el.setAttribute('hidden', '');
+      else el.removeAttribute('hidden');
+    });
+    if ($('cardPlayBackBtn')) {
+      if (cardPlayMode) $('cardPlayBackBtn').removeAttribute('hidden');
+      else $('cardPlayBackBtn').setAttribute('hidden', '');
+    }
     if ($('cardStageTitle')) $('cardStageTitle').textContent = cardPlayMode ? '角色卡试玩' : '角色卡编辑';
     updatePlayGate();
   }
@@ -3517,16 +3524,6 @@
     });
   }
   updatePlayGate();
-  if ($('cardDeleteLocalBtn')) {
-    $('cardDeleteLocalBtn').addEventListener('click', function () {
-      var id = currentCardLocalId();
-      if (!id) {
-        showMsg('当前没有打开的本地卡', false);
-        return;
-      }
-      deleteLocalCard(id);
-    });
-  }
   if ($('cardRefreshBtn')) {
     $('cardRefreshBtn').addEventListener('click', function () { refreshCardList(); });
   }

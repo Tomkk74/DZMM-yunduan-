@@ -918,6 +918,11 @@ textarea.mono {
   cursor: pointer;
 }
 
+/* display:inline-flex 会盖掉原生 [hidden]，必须显式压住 */
+.btn[hidden] {
+  display: none !important;
+}
+
 .btn:hover { background: #f0f0f0; }
 .btn.accent { background: var(--ink); color: #fff; }
 .btn.accent:hover { background: #222; }
