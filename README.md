@@ -32,13 +32,13 @@
 
 ### 环境
 
-- Windows（附带 `.bat`；其它系统可直接 `python console.py`）
+- Windows：双击 `start.bat`；其它系统：`python start.py`
 - [Python 3](https://www.python.org/)（安装时勾选 *Add to PATH*）
 - DZMM 账号（游戏卡需对该卡有 Game Studio 权限；角色卡试玩 / 上云需已登录）
 
 ### 启动
 
-双击或命令行运行**一个入口**即可（会清理旧端口、启动控制台；已登录且本地有 `publish/index.html` 时自动起预览）：
+**只用这一套入口**（不要再直接跑 `console.py`）：
 
 ```bat
 git clone https://github.com/Tomkk74/DZMM-yunduan-.git
@@ -46,14 +46,15 @@ cd DZMM-yunduan-
 start.bat
 ```
 
-或：
+非 Windows：
 
 ```bat
 python start.py
 ```
 
+会清理旧端口、启动控制台；已登录且本地有 `publish/index.html` 时自动起游戏预览。  
 浏览器打开：`http://127.0.0.1:8788/`  
-常用参数：`--no-open` 不弹窗、`--no-preview` 只开控制台、`--no-kill` 不清理占用端口的旧进程。
+可选参数：`--no-open` 不弹窗、`--no-preview` 只开控制台、`--no-kill` 不清理占用端口的旧进程。
 
 凭据写在本机 `.env`，**不会**上传到本仓库。也可在网页「账号登录」里勾选「保存密码到本机」。
 
@@ -127,15 +128,16 @@ Agent 入口：[`AGENTS.md`](AGENTS.md) → [`_模板/AGENTS.md`](_模板/AGENTS
 ### 推荐顺序
 
 ```text
-1 账号登录 → 2 项目配置 → 3（可选）拉取容器 → 4 启动预览 → 5 sync → 6 发布到线上
+1 一键启动 → 2 账号登录 → 3 项目配置 → 4（可选）拉取容器 → 5 sync → 6 发布到线上
 ```
 
 | 步骤 | 说明 |
 |:---|:---|
+| 一键启动 | `start.bat` / `python start.py`（唯一启动方式） |
 | 账号登录 | 邮箱密码；可写本机 `.env` |
 | 项目配置 | `character_id`（Workbench 地址栏）、本地项目路径（含 `publish/`）、预览端口（默认 `8791`） |
 | 拉取容器 | 云端整包落地；路径空则默认 `../{character_id}` |
-| 预览 | 内嵌 iframe / 新窗口；全屏后用悬浮球：菜单 / 刷新 / **增量 sync** / **发布** |
+| 预览 | 启动时若已登录且本地有 `publish/` 会自动拉起；也可在网页里启停；全屏后用悬浮球：菜单 / 刷新 / **增量 sync** / **发布** |
 | 同步 | 对照 `_sync_meta.json` 增量上传；强制全量加 `--full` |
 
 ### 界面截图
@@ -156,15 +158,17 @@ Agent 入口：[`AGENTS.md`](AGENTS.md) → [`_模板/AGENTS.md`](_模板/AGENTS
 
 ## ⌨️ 命令行（可选）
 
+启动请只用 `start.bat` / `start.py`。下面是登录 / 拉取 / 同步等辅助命令：
+
 | 脚本 | 作用 |
 |:---|:---|
-| `start.bat` / `start.py` | 一键启动（清端口 + 控制台 + 可选预览） |
+| `start.bat` / `start.py` | **唯一启动入口**（清端口 + 控制台 + 可选预览） |
 | `status.bat` | 配置 / 登录态 |
 | `pull.bat` | 拉取游戏容器 |
 | `sync.bat` | 同步本地到容器 |
-| `preview.bat` | 单独起本地预览 |
 
 ```bat
+python start.py
 python lib\dzmm_studio.py login --email you@mail.com --password "***"
 python lib\dzmm_studio.py status --character-id <CHARACTER_ID>
 python lib\pull_container.py --character-id <CHARACTER_ID>
@@ -177,9 +181,9 @@ python lib\dzmm_studio.py sync --character-id <CHARACTER_ID> --message "sync"
 
 ```text
 .
-├── start.py / start.bat       # 一键启动入口
-├── console.py                 # Web 控制台服务
-├── sync.bat / pull.bat …      # 可选命令行快捷脚本
+├── start.py / start.bat       # 唯一启动入口
+├── console.py                 # Web 控制台服务（由 start 拉起，勿直接当入口）
+├── sync.bat / pull.bat …      # 登录 / 拉取 / 同步等辅助脚本
 ├── web/                       # 控制台前端（游戏卡 + 角色卡 / 试玩）
 ├── lib/
 │   ├── dzmm_studio.py         # 登录、续期、游戏卡 sync / publish
@@ -232,7 +236,7 @@ copy .env.example .env
 <details>
 <summary><b>打不开 8788？</b></summary>
 
-确认已装 Python 3，且端口空闲；可改：`python console.py --port 8790`。
+确认已装 Python 3；用 `start.bat` / `python start.py` 启动（会自动清理旧端口）。改端口：`python start.py --port 8790`。
 </details>
 
 <details>
