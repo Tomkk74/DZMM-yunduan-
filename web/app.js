@@ -7,8 +7,9 @@
   var publishTimer = null;
   var SIDEBAR_KEY = 'dzmm-console-sidebar-collapsed';
   var CONSOLE_MODE_KEY = 'dzmm-console-mode';
+  var CONSOLE_CARD_KEY = 'dzmm-console-card-id';
   var consoleMode = 'game'; // game | card
-  var lastGamePanel = 'bridge';
+  var lastGamePanel = 'login';
   var FAB_POS_KEY = 'dzmm-console-fab-pos';
   var FAB_CIRC = 2 * Math.PI * 20; // r=20
   var currentCardId = '';
@@ -16,11 +17,44 @@
   var currentCardMtime = 0;
   var currentCardFolder = '';
   var cardPollTimer = null;
+  var cardListPollTimer = null;
+  var cardListPollBusy = false;
+  var cardListPollTick = 0;
+  var lastLocalListSig = '';
+  var lastCloudListSig = '';
   var cardApplyingRemote = false;
   var voiceCatalog = { public: [], mine: [] };
   var voiceAudio = null;
   var cloudCardItems = [];
   var cloudCardFilter = 'all'; // all | draft | pub
+  var cloudCardSearch = '';
+  var cloudVisibleCount = 20;
+  var cardPlayMode = false;
+  var playState = {
+    chatId: '',
+    cardId: 0,
+    messages: [],
+    sending: false,
+    modelsLoaded: false,
+    presetsLoaded: false,
+    defaultModel: '',
+    modelGroups: [],
+    selectedGroupKey: '',
+    selectedModel: '',
+    charName: '',
+    userName: '',
+    presetCatalog: [],
+    selectedPresetIds: [],
+    // 会话设置（chat.getSettings / updateSettings）
+    title: '会话',
+    style: 'standard',
+    maxTokens: 2500,
+    imageGenerationModel: 'anime',
+    enableHighlight: false,
+    classicUi: false,
+  };
+  var CLOUD_PAGE_SIZE = 20;
+  var cloudSearchTimer = null;
 
   function previewEmbedUrl(url) {
     if (!url) return '';
@@ -51,7 +85,7 @@
   function setBusy(busy, opts) {
     opts = opts || {};
     var keep = opts.keepEnabled || {};
-    ['loginBtn', 'logoutBtn', 'pingBtn', 'pullBtn', 'pullRetryBtn', 'previewStartBtn', 'previewStopBtn', 'previewReloadBtn', 'publishBtn', 'bridgeRefreshBtn', 'fabPublish', 'fabReload', 'fabSync', 'fabExpand', 'cardAiBtn', 'cardAiBtn2', 'cardNewBtn', 'cardNewBtn2', 'cardSaveBtn', 'cardRefreshBtn', 'cardCloudBtn', 'cardReloadBtn', 'cardMenuBtn', 'cardVoiceRefreshBtn', 'cardVoiceClearBtn', 'cardPublishBtn', 'cardDraftBtn', 'cardDeleteLocalBtn', 'cardCloudFilterAll', 'cardCloudFilterDraft', 'cardCloudFilterPub'].forEach(function (id) {
+    ['loginBtn', 'logoutBtn', 'pingBtn', 'pullBtn', 'pullRetryBtn', 'previewStartBtn', 'previewStopBtn', 'previewReloadBtn', 'publishBtn', 'bridgeRefreshBtn', 'fabPublish', 'fabReload', 'fabSync', 'fabExpand', 'cardAiBtn', 'cardAiBtn2', 'cardCopyPromptBtn', 'cardCopyPromptBtn2', 'cardNewBtn2', 'cardSaveBtn', 'cardExportPngBtn', 'cardRefreshBtn', 'cardCloudBtn', 'cardReloadBtn', 'cardMenuBtn', 'cardVoiceRefreshBtn', 'cardVoiceClearBtn', 'cardPublishBtn', 'cardDraftBtn', 'cardDeleteLocalBtn', 'cardCloudFilterAll', 'cardCloudFilterDraft', 'cardCloudFilterPub', 'cardCloudSearch'].forEach(function (id) {
       var el = $(id);
       if (!el) return;
       if (busy && keep[id]) {
@@ -383,7 +417,7 @@
       // 切到角色卡：侧栏直接是本地写卡；打开具体卡时再全屏
       if (opts.fullscreen) setCardFullscreen(true);
       else setCardFullscreen(false);
-      refreshCardList();
+      startCardListPoll();
       if ($('cardBrief') && $('cardBriefMain') && !$('cardBriefMain').value) {
         $('cardBriefMain').value = $('cardBrief').value || '';
       }
@@ -391,6 +425,7 @@
     } else {
       lastGamePanel = name;
       stopCardPoll();
+      stopCardListPoll();
       setStageMode('game');
       setCardFullscreen(false);
     }
@@ -413,7 +448,7 @@
     if (mode === 'card') {
       switchPanel('card', { fullscreen: false });
     } else {
-      switchPanel(opts.panel || lastGamePanel || 'bridge');
+      switchPanel(opts.panel || lastGamePanel || 'login');
     }
   }
 
@@ -650,6 +685,9 @@
     currentCard = card || null;
     currentCardId = localId || (card && card._meta && card._meta.localId) || '';
     currentCardFolder = (card && card._meta && card._meta.folder) || currentCardFolder || '';
+    try {
+      if (currentCardId) localStorage.setItem(CONSOLE_CARD_KEY, currentCardId);
+    } catch (_) {}
     if (typeof opts.mtime === 'number') currentCardMtime = opts.mtime;
     else if (card && card._meta && card._meta.mtime) currentCardMtime = Number(card._meta.mtime) || currentCardMtime;
     var d = (card && card.data) || {};
@@ -693,6 +731,11 @@
     updateCardPreview();
     cardApplyingRemote = false;
     if (currentCardId) startCardPoll();
+    updatePlayGate();
+    // 换卡时退出试玩会话
+    if (cardPlayMode && playState.cardId && playState.cardId !== currentCloudCardId()) {
+      exitCardPlay({ keepPanel: false });
+    }
   }
 
   function collectCardFromForm() {
@@ -763,6 +806,57 @@
         setCardMsg('已同步本地文件 · ' + (data.localId || currentCardId), true);
       } catch (_) {}
     }, 700);
+  }
+
+  function stopCardListPoll() {
+    if (cardListPollTimer) {
+      clearInterval(cardListPollTimer);
+      cardListPollTimer = null;
+    }
+    cardListPollBusy = false;
+  }
+
+  function listItemsSig(items, kind) {
+    return (items || []).map(function (it) {
+      if (kind === 'cloud') {
+        return [
+          it.cloudId, it.isDraft ? 1 : 0, it.name || '',
+          it.isListed ? 1 : 0, it.isPendingReview ? 1 : 0,
+          it.publishStatus || '', it.dbId || '', it.updatedAt || it.createdAt || ''
+        ].join('\t');
+      }
+      return [
+        it.localId, it.mtime || 0, it.updatedAt || '',
+        it.cloudId || '', it.draftId || '',
+        it.isListed ? 1 : 0, it.isPendingReview ? 1 : 0, it.publishStatus || '',
+        it.name || ''
+      ].join('\t');
+    }).join('|');
+  }
+
+  async function tickCardLists() {
+    if (consoleMode !== 'card' || cardListPollBusy) return;
+    cardListPollBusy = true;
+    cardListPollTick += 1;
+    try {
+      await refreshCardList({ quiet: true });
+      // 多数轮询走轻量云端列表；每 4 次补一次上架状态
+      var quick = (cardListPollTick % 4) !== 0;
+      await refreshCloudCardList(false, { quiet: true, quick: quick, skipLocal: true });
+    } catch (_) {
+      // 静默：登录失效时不刷错误打扰编辑
+    } finally {
+      cardListPollBusy = false;
+    }
+  }
+
+  function startCardListPoll() {
+    stopCardListPoll();
+    lastLocalListSig = '';
+    lastCloudListSig = '';
+    cardListPollTick = 0;
+    tickCardLists();
+    cardListPollTimer = setInterval(tickCardLists, 2500);
   }
 
   var _tokenEncoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
@@ -961,6 +1055,7 @@
         currentCardFolder = '';
         currentCardMtime = 0;
         stopCardPoll();
+        try { localStorage.removeItem(CONSOLE_CARD_KEY); } catch (_) {}
         if ($('cardStageMeta')) $('cardStageMeta').textContent = '未打开卡';
         if ($('cardTokenSummary')) {
           $('cardTokenSummary').innerHTML =
@@ -1064,18 +1159,60 @@
     return meta;
   }
 
-  function renderCloudCardList() {
+  function filteredCloudItems() {
+    var q = String(cloudCardSearch || '').trim().toLowerCase();
+    return (cloudCardItems || []).filter(function (it) {
+      if (cloudCardFilter === 'draft' && !it.isDraft) return false;
+      if (cloudCardFilter === 'pub' && it.isDraft) return false;
+      if (!q) return true;
+      var name = String(it.name || '').toLowerCase();
+      var id = String(it.cloudId || '');
+      var db = String(it.dbId || it.characterId || '');
+      return name.indexOf(q) >= 0 || id.indexOf(q) >= 0 || (db && db.indexOf(q) >= 0);
+    });
+  }
+
+  function bindCloudListScroll() {
+    var sc = $('cloudCardListScroll');
+    if (!sc || sc.getAttribute('data-bound') === '1') return;
+    sc.setAttribute('data-bound', '1');
+    sc.addEventListener('scroll', function () {
+      if (sc.scrollTop + sc.clientHeight < sc.scrollHeight - 48) return;
+      var filtered = filteredCloudItems();
+      if (cloudVisibleCount >= filtered.length) return;
+      var keep = sc.scrollTop;
+      cloudVisibleCount = Math.min(filtered.length, cloudVisibleCount + CLOUD_PAGE_SIZE);
+      renderCloudCardList();
+      sc.scrollTop = keep;
+    });
+  }
+
+  function renderCloudCardList(opts) {
+    opts = opts || {};
+    if (opts.resetPage) cloudVisibleCount = CLOUD_PAGE_SIZE;
     var box = $('cloudCardBox');
     var list = $('cloudCardList');
+    var more = $('cloudCardMore');
     if (!box || !list) return;
+    bindCloudListScroll();
     list.innerHTML = '';
     var listedMap = localListedMap();
-    var items = (cloudCardItems || []).filter(function (it) {
-      if (cloudCardFilter === 'draft') return !!it.isDraft;
-      if (cloudCardFilter === 'pub') return !it.isDraft;
-      return true;
-    });
+    var filtered = filteredCloudItems();
+    if (cloudVisibleCount < CLOUD_PAGE_SIZE) cloudVisibleCount = CLOUD_PAGE_SIZE;
+    if (cloudVisibleCount > filtered.length && filtered.length > 0) {
+      cloudVisibleCount = filtered.length;
+    }
+    var items = filtered.slice(0, cloudVisibleCount);
     box.hidden = false;
+    if (more) {
+      if (!filtered.length) {
+        more.textContent = cloudCardSearch.trim() ? '没有匹配的卡' : '云端列表为空';
+      } else if (items.length < filtered.length) {
+        more.textContent = '显示 ' + items.length + ' / ' + filtered.length + ' · 下拉加载更多';
+      } else {
+        more.textContent = '共 ' + filtered.length + ' 张';
+      }
+    }
     items.forEach(function (it) {
       var cid = parseInt(it.cloudId, 10);
       // 优先用云端真实 isPublic / publishStatus；本地 _meta 仅作兜底
@@ -1166,37 +1303,70 @@
     }
   }
 
-  async function refreshCloudCardList(showToast) {
-    var data = await api('/api/card/cloud');
+  async function refreshCloudCardList(showToast, opts) {
+    opts = opts || {};
+    var qs = opts.quick ? '?quick=1' : '';
+    var data = await api('/api/card/cloud' + qs);
     if (!data.ok) {
-      if (showToast !== false) showMsg(data.error || '云端列表失败（需已登录）', false);
-      if ($('cloudCardBox')) $('cloudCardBox').hidden = true;
+      if (showToast !== false && !opts.quiet) {
+        showMsg(data.error || '云端列表失败（需已登录）', false);
+      }
+      // 轮询失败不强制藏列表；手动拉取仍隐藏
+      if (!opts.quiet && $('cloudCardBox')) $('cloudCardBox').hidden = true;
       return data;
     }
-    // 先刷新本地列表，便于合并「已上架」标记
-    try { await refreshCardList(); } catch (_) {}
-    cloudCardItems = data.items || [];
+    if (!opts.skipLocal) {
+      try { await refreshCardList({ quiet: !!opts.quiet }); } catch (_) {}
+    }
+    var items = data.items || [];
+    var sig = listItemsSig(items, 'cloud');
+    // quick 轮询若与上次完整列表条数/id 一致则合并保留上架字段，避免绿标闪烁
+    if (opts.quick && cloudCardItems.length && items.length === cloudCardItems.length) {
+      var prevMap = {};
+      cloudCardItems.forEach(function (it) {
+        prevMap[(it.isDraft ? 'd' : 'p') + ':' + it.cloudId] = it;
+      });
+      items.forEach(function (it) {
+        var prev = prevMap[(it.isDraft ? 'd' : 'p') + ':' + it.cloudId];
+        if (!prev) return;
+        if (it.isListed == null && prev.isListed != null) it.isListed = prev.isListed;
+        if (it.isPendingReview == null && prev.isPendingReview != null) it.isPendingReview = prev.isPendingReview;
+        if (!it.publishStatus && prev.publishStatus) it.publishStatus = prev.publishStatus;
+        if (!it.isPublic && prev.isPublic) it.isPublic = prev.isPublic;
+      });
+      sig = listItemsSig(items, 'cloud');
+    }
+    if (opts.quiet && sig === lastCloudListSig) return data;
+    lastCloudListSig = sig;
+    cloudCardItems = items;
     renderCloudCardList();
     var drafts = cloudCardItems.filter(function (x) { return x.isDraft; }).length;
     var pubs = cloudCardItems.length - drafts;
-    if (showToast !== false) {
+    if (showToast !== false && !opts.quiet) {
       showMsg('云端 ' + cloudCardItems.length + ' 项 · 草稿 ' + drafts + ' · 已保存 ' + pubs, true);
     }
     return data;
   }
 
-  async function refreshCardList() {
+  async function refreshCardList(opts) {
+    opts = opts || {};
     try {
       var data = await api('/api/card/list');
       var list = $('cardList');
-      list.innerHTML = '';
+      if (!list) return data;
       if (!data.ok) {
-        setCardMsg(data.error || '列表失败', false);
-        return;
+        if (!opts.quiet) setCardMsg(data.error || '列表失败', false);
+        return data;
       }
       var items = data.items || [];
+      var sig = listItemsSig(items, 'local');
+      if (opts.quiet && sig === lastLocalListSig) return data;
+      lastLocalListSig = sig;
+      list.innerHTML = '';
       window.__localCardListed = items;
-      setCardMsg('本机 ' + items.length + ' 张 · ' + (data.cardsDir || '卡/'), true);
+      if (!opts.quiet) {
+        setCardMsg('本机 ' + items.length + ' 张 · ' + (data.cardsDir || '卡/'), true);
+      }
       items.forEach(function (it) {
         var li = document.createElement('li');
         var statusNodes = [];
@@ -1241,8 +1411,10 @@
         li.appendChild(actions);
         list.appendChild(li);
       });
+      return data;
     } catch (e) {
-      setCardMsg(String(e.message || e), false);
+      if (!opts.quiet) setCardMsg(String(e.message || e), false);
+      return { ok: false, error: String(e.message || e) };
     }
   }
 
@@ -2179,12 +2351,14 @@
     var brief = getCardBrief();
     if (!name && brief.length < 2) {
       showMsg('请先填卡名（或创意简述）', false);
+      setCardMsg('请先填卡名（或创意简述）', false);
       return;
     }
     if ($('cardBrief')) $('cardBrief').value = brief;
     if ($('cardBriefMain')) $('cardBriefMain').value = brief;
     setBusy(true);
     showMsg('正在创建本地卡夹…', true);
+    setCardMsg('正在创建本地卡夹…', true);
     try {
       var data = await api('/api/card/ai', {
         method: 'POST',
@@ -2192,28 +2366,51 @@
       });
       if (!data.ok) {
         showMsg(data.error || '创建卡夹失败', false);
+        setCardMsg(data.error || '创建卡夹失败', false);
         return;
       }
       fillCardForm(data.card, data.localId || '', { mtime: data.mtime || 0 });
       currentCardFolder = data.folder || data.path || '';
+      if ($('cardFolderName')) $('cardFolderName').value = data.localId || name;
       setStageMode('card');
       setCardFullscreen(true);
       await refreshCardList();
-      showMsg(data.hint || ('已监听 · ' + currentCardFolder), true);
+      // 创建并监听后：自动复制「写这张卡」的开聊提示词
+      var copied = await runCopyChatPrompt({
+        name: data.localId || name,
+        brief: brief,
+        auto: true,
+      });
+      if (!copied) {
+        var fallback = '已监听 · ' + (data.localId || currentCardFolder)
+          + '（开聊提示词未复制成功，可点「复制开聊提示词」）';
+        showMsg(fallback, true);
+        setCardMsg(fallback, true);
+      }
     } catch (e) {
       showMsg(String(e.message || e), false);
+      setCardMsg(String(e.message || e), false);
     } finally {
       setBusy(false);
     }
   }
 
   async function runCardNew() {
+    var name = window.prompt('请输入新卡名称（必填）', '');
+    if (name === null) return; // 取消
+    name = String(name || '').trim();
+    if (!name) {
+      showMsg('必须填写卡名才能新建', false);
+      return;
+    }
     setBusy(true);
     try {
-      var name = ($('cardFolderName') && $('cardFolderName').value.trim()) || '未命名角色';
+      // 空白新建：用弹窗卡名，简述清空，不沿用上一张
+      if ($('cardBrief')) $('cardBrief').value = '';
+      if ($('cardBriefMain')) $('cardBriefMain').value = '';
       var data = await api('/api/card/new', {
         method: 'POST',
-        body: JSON.stringify({ name: name, brief: getCardBrief() }),
+        body: JSON.stringify({ name: name, brief: '', blank: true }),
       });
       if (!data.ok) {
         showMsg(data.error || '新建失败', false);
@@ -2221,10 +2418,14 @@
       }
       fillCardForm(data.card, data.localId, { mtime: data.mtime || 0 });
       currentCardFolder = data.folder || data.path || '';
+      if ($('cardName')) $('cardName').value = name;
+      if ($('cardFolderName')) $('cardFolderName').value = data.localId || name;
+      if ($('cardBrief')) $('cardBrief').value = '';
+      if ($('cardBriefMain')) $('cardBriefMain').value = '';
       setStageMode('card');
       setCardFullscreen(true);
       await refreshCardList();
-      showMsg('已新建卡夹 · ' + (data.folder || data.localId), true);
+      showMsg('已新建空白卡夹 · ' + (data.folder || data.localId), true);
     } catch (e) {
       showMsg(String(e.message || e), false);
     } finally {
@@ -2232,9 +2433,96 @@
     }
   }
 
+  async function copyTextToClipboard(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return;
+      } catch (_) {
+        /* fall through to execCommand */
+      }
+    }
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    ta.setSelectionRange(0, ta.value.length);
+    var ok = false;
+    try {
+      ok = document.execCommand('copy');
+    } finally {
+      document.body.removeChild(ta);
+    }
+    if (!ok) throw new Error('浏览器拒绝写入剪贴板，请手动复制');
+  }
+
+  function resolveChatPromptContext(opts) {
+    opts = opts || {};
+    var name = (opts.name || '').trim()
+      || currentCardId
+      || ($('cardFolderName') && $('cardFolderName').value.trim())
+      || ($('cardName') && $('cardName').value.trim())
+      || '';
+    var brief = (opts.brief != null ? String(opts.brief) : getCardBrief()).trim();
+    if (!brief && currentCard && currentCard._meta && currentCard._meta.brief) {
+      brief = String(currentCard._meta.brief || '').trim();
+    }
+    return { name: name, brief: brief };
+  }
+
+  async function runCopyChatPrompt(opts) {
+    opts = opts || {};
+    var ctx = resolveChatPromptContext(opts);
+    var name = ctx.name;
+    var brief = ctx.brief;
+    var manageBusy = !opts.auto;
+    if (manageBusy) setBusy(true);
+    setCardMsg('正在生成「' + (name || '未命名') + '」开聊提示词…', true);
+    try {
+      if (!name) {
+        var needName = '请先填写卡名，或点「创建卡夹并监听」后再复制';
+        setCardMsg(needName, false);
+        showMsg(needName, false);
+        return false;
+      }
+      var q = '/api/card/chat-prompt?name=' + encodeURIComponent(name)
+        + '&brief=' + encodeURIComponent(brief);
+      var data = await api(q);
+      if (!data.ok || !data.text) {
+        var err = data.error || '读取开聊提示词失败';
+        if (err === '无效响应' || /HTTP 404/i.test(err)) {
+          err = '开聊提示词接口不可用，请重启控制台（python console.py）后重试';
+        }
+        setCardMsg(err, false);
+        showMsg(err, false);
+        return false;
+      }
+      await copyTextToClipboard(data.text);
+      var hint = opts.auto
+        ? ('已创建并监听「' + name + '」，开聊提示词已复制 · 粘贴到新对话即可开始写这张卡')
+        : ('已复制开聊提示词 · 创作「' + name + '」');
+      if (!opts.auto && data.filledBrief) hint += '（含简述）';
+      setCardMsg(hint, true);
+      showMsg(hint, true);
+      return true;
+    } catch (e) {
+      var msg = String(e.message || e);
+      setCardMsg(msg, false);
+      showMsg(msg, false);
+      return false;
+    } finally {
+      if (manageBusy) setBusy(false);
+    }
+  }
+
   if ($('cardAiBtn')) $('cardAiBtn').addEventListener('click', runCardAiWrite);
   if ($('cardAiBtn2')) $('cardAiBtn2').addEventListener('click', runCardAiWrite);
-  if ($('cardNewBtn')) $('cardNewBtn').addEventListener('click', runCardNew);
+  if ($('cardCopyPromptBtn')) $('cardCopyPromptBtn').addEventListener('click', function () { runCopyChatPrompt(); });
+  if ($('cardCopyPromptBtn2')) $('cardCopyPromptBtn2').addEventListener('click', function () { runCopyChatPrompt(); });
   if ($('cardNewBtn2')) $('cardNewBtn2').addEventListener('click', runCardNew);
   if ($('cardMenuBtn')) {
     $('cardMenuBtn').addEventListener('click', function () {
@@ -2252,6 +2540,33 @@
 
   if ($('cardSaveBtn')) {
     $('cardSaveBtn').addEventListener('click', function () { saveCurrentCard(); });
+  }
+  if ($('cardExportPngBtn')) {
+    $('cardExportPngBtn').addEventListener('click', async function () {
+      var localId = currentCardLocalId();
+      if (!localId) {
+        showMsg('请先打开或保存一张本地卡', false);
+        return;
+      }
+      setBusy(true);
+      showMsg('正在打包 PNG 卡（封面=第一张图）…', true);
+      try {
+        // 先落盘，保证导出内容最新
+        await saveCurrentCard();
+        localId = currentCardLocalId() || localId;
+        var a = document.createElement('a');
+        a.href = '/api/card/export-png?id=' + encodeURIComponent(localId) + '&t=' + Date.now();
+        a.download = localId + '.png';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        showMsg('已导出 PNG 卡 · 卡/' + localId + '/export/', true);
+      } catch (e) {
+        showMsg(String(e.message || e), false);
+      } finally {
+        setBusy(false);
+      }
+    });
   }
 
   function cardLooksEmpty(card) {
@@ -2317,6 +2632,7 @@
           true
         );
       }
+      updatePlayGate();
       refreshCloudCardList(false);
     } catch (e) {
       showMsg(String(e.message || e), false);
@@ -2327,6 +2643,880 @@
 
   if ($('cardPublishBtn')) $('cardPublishBtn').addEventListener('click', function () { saveToCloud(false); });
   if ($('cardDraftBtn')) $('cardDraftBtn').addEventListener('click', function () { saveToCloud(true); });
+
+  function currentCloudCardId() {
+    if (!currentCard) return 0;
+    var d = currentCard.data || {};
+    var meta = currentCard._meta || {};
+    if (meta.source === 'cloud-draft' || meta.isDraft) return 0;
+    var id = parseInt(d.db_id || meta.cloudId || 0, 10);
+    return id > 0 ? id : 0;
+  }
+
+  function updatePlayGate() {
+    var btn = $('cardPlayBtn');
+    if (!btn) return;
+    var cid = currentCloudCardId();
+    btn.disabled = !cid || cardPlayMode;
+    btn.title = cid
+      ? ('试玩云端卡 #' + cid)
+      : '需先「保存到云端」得到正式卡 ID（草稿不可试玩）';
+  }
+
+  function setCardPlayMode(on) {
+    cardPlayMode = !!on;
+    var stage = $('cardStage');
+    if (stage) stage.classList.toggle('is-play', cardPlayMode);
+    if ($('cardForm')) {
+      $('cardForm').hidden = cardPlayMode;
+      // 双保险：退出试玩时清掉可能残留的内联样式
+      if (!cardPlayMode) $('cardForm').style.removeProperty('display');
+    }
+    if ($('cardPlayPanel')) $('cardPlayPanel').hidden = !cardPlayMode;
+    if ($('cardPlayBtn')) $('cardPlayBtn').hidden = cardPlayMode;
+    if ($('cardPlayBackBtn')) $('cardPlayBackBtn').hidden = !cardPlayMode;
+    if ($('cardStageTitle')) $('cardStageTitle').textContent = cardPlayMode ? '角色卡试玩' : '角色卡编辑';
+    updatePlayGate();
+  }
+
+  function exitCardPlay(opts) {
+    opts = opts || {};
+    if (!opts.keepSession) {
+      playState.chatId = '';
+      playState.messages = [];
+      playState.sending = false;
+      playState.charName = '';
+    }
+    if (!opts.keepPanel) setCardPlayMode(false);
+    if ($('playStatus')) $('playStatus').textContent = playState.chatId ? ('会话 ' + playState.chatId.slice(0, 8) + '…') : '未开始';
+  }
+
+  function formatContextLabel(maxContext) {
+    var n = Number(maxContext) || 0;
+    if (n >= 1000) return Math.round(n / 1000) + 'K';
+    return String(n || '');
+  }
+
+  /** 官网：模型按 series 分组，上下文长度 = 同组 contexts[] 不同 internalName */
+  function parseModelGroups(modelsPayload) {
+    var root = modelsPayload || {};
+    var cats = root.categories || [];
+    var groups = [];
+    var seen = {};
+    if (Array.isArray(cats)) {
+      cats.forEach(function (c) {
+        var catName = (c && (c.name || c.title || c.key)) || '';
+        var list = (c && c.modelGroups) || [];
+        if (!Array.isArray(list)) return;
+        list.forEach(function (g, idx) {
+          var contexts = Array.isArray(g.contexts) ? g.contexts.filter(function (x) {
+            return x && (x.internalName || x.id);
+          }) : [];
+          if (!contexts.length) return;
+          var series = String(g.seriesKey || g.displayName || contexts[0].displayName || ('model-' + idx));
+          var key = String(g.categoryKey || catName || 'cat') + '::' + series;
+          if (seen[key]) return;
+          seen[key] = 1;
+          groups.push({
+            key: key,
+            seriesKey: series,
+            category: catName,
+            thinkingSupported: !!g.thinkingSupported,
+            contexts: contexts.map(function (ctx) {
+              return {
+                id: String(ctx.internalName || ctx.id),
+                label: formatContextLabel(ctx.maxContext) || String(ctx.displayName || ctx.internalName),
+                maxContext: Number(ctx.maxContext) || 0,
+                displayName: ctx.displayName || '',
+                isRecommended: !!ctx.isRecommended,
+              };
+            }),
+          });
+        });
+      });
+    }
+    return { groups: groups, defaultModel: root.defaultModel || '' };
+  }
+
+  function findPlayGroup(key) {
+    var list = playState.modelGroups || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].key === key) return list[i];
+    }
+    return null;
+  }
+
+  function findGroupByModelId(modelId) {
+    var id = String(modelId || '');
+    var list = playState.modelGroups || [];
+    for (var i = 0; i < list.length; i++) {
+      var g = list[i];
+      for (var j = 0; j < g.contexts.length; j++) {
+        if (g.contexts[j].id === id) return g;
+      }
+    }
+    return null;
+  }
+
+  function pickContextForGroup(group, preferId) {
+    if (!group || !group.contexts.length) return null;
+    if (preferId) {
+      for (var i = 0; i < group.contexts.length; i++) {
+        if (group.contexts[i].id === preferId) return group.contexts[i];
+      }
+    }
+    // 官网默认偏 16K（推荐）；否则取最小上下文
+    var rec = null;
+    var smallest = group.contexts[0];
+    group.contexts.forEach(function (c) {
+      if (c.isRecommended && (!rec || c.maxContext < rec.maxContext)) rec = c;
+      if (c.maxContext && c.maxContext < (smallest.maxContext || Infinity)) smallest = c;
+    });
+    return rec || smallest || group.contexts[0];
+  }
+
+  function renderPlayContextPills() {
+    var wrap = $('playContextLength');
+    if (!wrap) return;
+    wrap.innerHTML = '';
+    var group = findPlayGroup(playState.selectedGroupKey);
+    if (!group) {
+      wrap.textContent = '—';
+      return;
+    }
+    group.contexts.forEach(function (ctx) {
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'play-context-pill' + (ctx.id === playState.selectedModel ? ' is-active' : '');
+      btn.textContent = ctx.label;
+      btn.title = ctx.displayName || ctx.id;
+      btn.addEventListener('click', function () {
+        playState.selectedModel = ctx.id;
+        renderPlayContextPills();
+        if (playState.chatId) {
+          patchPlaySettings({ model: ctx.id }).catch(function () {});
+        }
+      });
+      wrap.appendChild(btn);
+    });
+  }
+
+  function populatePlayModelSelect(parsed) {
+    var sel = $('playModelSelect');
+    if (!sel) return;
+    playState.modelGroups = parsed.groups || [];
+    playState.defaultModel = parsed.defaultModel || '';
+    sel.innerHTML = '';
+    if (!playState.modelGroups.length) {
+      sel.innerHTML = '<option value="">（无可用模型）</option>';
+      playState.selectedGroupKey = '';
+      playState.selectedModel = '';
+      renderPlayContextPills();
+      return;
+    }
+    playState.modelGroups.forEach(function (g) {
+      var opt = document.createElement('option');
+      opt.value = g.key;
+      opt.textContent = g.category ? (g.seriesKey + ' · ' + g.category) : g.seriesKey;
+      sel.appendChild(opt);
+    });
+    var group = findGroupByModelId(playState.selectedModel || playState.defaultModel)
+      || findPlayGroup(playState.selectedGroupKey)
+      || playState.modelGroups[0];
+    playState.selectedGroupKey = group.key;
+    sel.value = group.key;
+    var ctx = pickContextForGroup(group, playState.selectedModel || playState.defaultModel);
+    playState.selectedModel = ctx ? ctx.id : '';
+    renderPlayContextPills();
+  }
+
+  function onPlayModelGroupChange() {
+    var sel = $('playModelSelect');
+    if (!sel) return;
+    var group = findPlayGroup(sel.value);
+    if (!group) return;
+    playState.selectedGroupKey = group.key;
+    // 切换系列时尽量保留同档上下文（如仍选 16K）
+    var prev = null;
+    var old = findGroupByModelId(playState.selectedModel);
+    if (old) {
+      for (var i = 0; i < old.contexts.length; i++) {
+        if (old.contexts[i].id === playState.selectedModel) {
+          prev = old.contexts[i].maxContext;
+          break;
+        }
+      }
+    }
+    var matched = null;
+    if (prev) {
+      for (var j = 0; j < group.contexts.length; j++) {
+        if (group.contexts[j].maxContext === prev) {
+          matched = group.contexts[j];
+          break;
+        }
+      }
+    }
+    var ctx = matched || pickContextForGroup(group, null);
+    playState.selectedModel = ctx ? ctx.id : '';
+    renderPlayContextPills();
+    if (playState.chatId && playState.selectedModel) {
+      patchPlaySettings({ model: playState.selectedModel }).catch(function () {});
+    }
+  }
+
+  async function loadPlayControls() {
+    if ($('playStatus')) $('playStatus').textContent = '加载模型/预设…';
+    try {
+      var modelsRes = await api('/api/card/play/models');
+      if (modelsRes.ok) {
+        populatePlayModelSelect(parseModelGroups(modelsRes.models || {}));
+        playState.modelsLoaded = true;
+      }
+    } catch (e) {
+      if ($('playModelSelect')) {
+        $('playModelSelect').innerHTML = '<option value="">模型加载失败</option>';
+      }
+    }
+    try {
+      var pre = await api('/api/card/play/presets');
+      var list = (pre && pre.presets) || [];
+      var active = (pre && pre.activePresetIds) || [];
+      playState.presetCatalog = Array.isArray(list) ? list.slice() : [];
+      if (!playState.selectedPresetIds.length && Array.isArray(active) && active.length) {
+        playState.selectedPresetIds = active.map(String);
+      }
+      playState.presetsLoaded = true;
+      // 官网规则：{{user}} = 登录用户 fullName（非邮箱、非手动填）
+      var dn = (pre && pre.displayName) || '';
+      if (dn) playState.userName = String(dn).trim();
+      updatePlayPresetBtn();
+      updatePlayUserLabel();
+      if (cardPlayMode) renderPlayMessages();
+    } catch (_) {}
+    if ($('playStatus')) {
+      $('playStatus').textContent = playState.chatId
+        ? ('会话 ' + String(playState.chatId).slice(0, 8) + '…')
+        : '就绪';
+    }
+  }
+
+  function selectedPresetIds() {
+    return (playState.selectedPresetIds || []).slice();
+  }
+
+  function updatePlayPresetBtn() {
+    var btn = $('playPresetBtn');
+    if (!btn) return;
+    var n = selectedPresetIds().length;
+    btn.textContent = n ? ('预设 · ' + n) : '预设';
+  }
+
+  function updatePlayUserLabel() {
+    var el = $('playUserLabel');
+    if (!el) return;
+    var name = playUserName();
+    el.textContent = '{{user}} · ' + name;
+    el.title = '开场白与显示中的 {{user}} = 登录用户名（' + name + '）';
+  }
+
+  function openPlayPresetModal() {
+    var modal = $('playPresetModal');
+    var list = $('playPresetList');
+    if (!modal || !list) return;
+    list.innerHTML = '';
+    var catalog = playState.presetCatalog || [];
+    var selected = {};
+    selectedPresetIds().forEach(function (id) { selected[id] = 1; });
+    if (!catalog.length) {
+      var empty = document.createElement('p');
+      empty.className = 'hint';
+      empty.textContent = '账号暂无预设';
+      list.appendChild(empty);
+    } else {
+      catalog.forEach(function (p) {
+        var id = String(p.id || '');
+        if (!id) return;
+        var label = document.createElement('label');
+        label.className = 'play-preset-item';
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.value = id;
+        cb.checked = !!selected[id];
+        var body = document.createElement('span');
+        var name = document.createElement('span');
+        name.className = 'play-preset-name';
+        name.textContent = p.name || p.title || id;
+        body.appendChild(name);
+        var desc = p.description || p.desc || '';
+        if (desc) {
+          var d = document.createElement('span');
+          d.className = 'play-preset-desc';
+          d.textContent = String(desc).slice(0, 80);
+          body.appendChild(d);
+        }
+        label.appendChild(cb);
+        label.appendChild(body);
+        list.appendChild(label);
+      });
+    }
+    modal.hidden = false;
+  }
+
+  function closePlayPresetModal() {
+    if ($('playPresetModal')) $('playPresetModal').hidden = true;
+  }
+
+  function applyPlayPresetModal() {
+    var list = $('playPresetList');
+    if (!list) return;
+    var ids = [];
+    list.querySelectorAll('input[type="checkbox"]').forEach(function (cb) {
+      if (cb.checked && cb.value) ids.push(cb.value);
+    });
+    playState.selectedPresetIds = ids;
+    updatePlayPresetBtn();
+    closePlayPresetModal();
+  }
+
+  function playCharName() {
+    return (
+      playState.charName ||
+      ($('cardName') && $('cardName').value.trim()) ||
+      ($('cardFolderName') && $('cardFolderName').value.trim()) ||
+      '角色'
+    );
+  }
+
+  function playUserName() {
+    return (playState.userName || '').trim() || '用户';
+  }
+
+  function applyPlayMacros(text) {
+    var s = text == null ? '' : String(text);
+    if (!s) return s;
+    var user = playUserName();
+    var char = playCharName();
+    return s
+      .replace(/\{\{user\}\}/gi, user)
+      .replace(/\{\{char\}\}/gi, char)
+      .replace(/<USER>/gi, user)
+      .replace(/<BOT>/gi, char)
+      .replace(/<CHAR>/gi, char);
+  }
+
+  function appendHighlightedText(parent, text) {
+    var s = text == null ? '' : String(text);
+    if (!s) return;
+    if (!playState.enableHighlight) {
+      parent.appendChild(document.createTextNode(s));
+      return;
+    }
+    // 高亮中文引号内重点（官网「开启高亮」同类本地显示）
+    var re = /([「『])([^」』]+)([」』])/g;
+    var last = 0;
+    var m;
+    while ((m = re.exec(s)) !== null) {
+      if (m.index > last) parent.appendChild(document.createTextNode(s.slice(last, m.index)));
+      parent.appendChild(document.createTextNode(m[1]));
+      var mark = document.createElement('mark');
+      mark.className = 'play-hl';
+      mark.textContent = m[2];
+      parent.appendChild(mark);
+      parent.appendChild(document.createTextNode(m[3]));
+      last = m.index + m[0].length;
+    }
+    if (last < s.length) parent.appendChild(document.createTextNode(s.slice(last)));
+  }
+
+  /** 角色卡惯例：*旁白* → 斜体显示（不露出星号）；**粗体** 同理 */
+  function appendPlayFormatted(parent, text) {
+    var s = text == null ? '' : String(text);
+    if (!s) return;
+    var re = /\*\*([^*]+)\*\*|\*([^*\n]+)\*/g;
+    var last = 0;
+    var m;
+    while ((m = re.exec(s)) !== null) {
+      if (m.index > last) {
+        appendHighlightedText(parent, s.slice(last, m.index));
+      }
+      if (m[1] != null) {
+        var strong = document.createElement('strong');
+        if (playState.enableHighlight) strong.className = 'play-hl';
+        strong.textContent = m[1];
+        parent.appendChild(strong);
+      } else {
+        var em = document.createElement('em');
+        em.className = 'play-narration';
+        em.textContent = m[2];
+        parent.appendChild(em);
+      }
+      last = m.index + m[0].length;
+    }
+    if (last < s.length) {
+      appendHighlightedText(parent, s.slice(last));
+    }
+  }
+
+  function readLocalPlayPrefs() {
+    try {
+      playState.enableHighlight = localStorage.getItem('chat_enable_highlight') === 'true';
+    } catch (_) {
+      playState.enableHighlight = false;
+    }
+    try {
+      playState.classicUi = localStorage.getItem('dzmm.playClassicUi') === 'true';
+    } catch (_) {
+      playState.classicUi = false;
+    }
+  }
+
+  function applyPlayPanelChrome() {
+    var panel = $('cardPlayPanel');
+    if (!panel) return;
+    panel.classList.toggle('is-highlight', !!playState.enableHighlight);
+    panel.classList.toggle('is-classic', !!playState.classicUi);
+  }
+
+  function applyPlayChatSettings(settings) {
+    if (!settings || typeof settings !== 'object') return;
+    if (settings.title != null) playState.title = String(settings.title || '会话');
+    if (settings.style) playState.style = String(settings.style);
+    if (settings.maxTokens != null && settings.maxTokens !== '') {
+      var mt = parseInt(settings.maxTokens, 10);
+      if (!isNaN(mt)) playState.maxTokens = mt;
+    }
+    if (settings.imageGenerationModel) {
+      playState.imageGenerationModel = String(settings.imageGenerationModel);
+    }
+    if (settings.model) {
+      playState.selectedModel = String(settings.model);
+      var g = findGroupByModelId(playState.selectedModel);
+      if (g) {
+        playState.selectedGroupKey = g.key;
+        if ($('playModelSelect')) $('playModelSelect').value = g.key;
+        renderPlayContextPills();
+      }
+    }
+    if ($('playDeepThinking') && typeof settings.deepThinking === 'boolean') {
+      $('playDeepThinking').checked = settings.deepThinking;
+    }
+    if ($('playMemoryEnhance') && typeof settings.enableMemoryEnhance === 'boolean') {
+      $('playMemoryEnhance').checked = settings.enableMemoryEnhance;
+    }
+    applyPlayPanelChrome();
+  }
+
+  async function patchPlaySettings(partial) {
+    if (!playState.chatId || !partial || typeof partial !== 'object') return null;
+    var res = await api('/api/card/play/settings', {
+      method: 'POST',
+      body: JSON.stringify({ chatId: playState.chatId, settings: partial }),
+    });
+    if (res && res.ok && res.settings) {
+      applyPlayChatSettings(res.settings);
+    }
+    return res;
+  }
+
+  function fillPlaySettingsForm() {
+    if ($('playSetHighlight')) $('playSetHighlight').checked = !!playState.enableHighlight;
+    if ($('playSetClassic')) $('playSetClassic').checked = !!playState.classicUi;
+    if ($('playSetTitle')) $('playSetTitle').value = playState.title || '会话';
+    if ($('playSetStyle')) $('playSetStyle').value = playState.style || 'standard';
+    if ($('playSetMaxTokens')) $('playSetMaxTokens').value = String(playState.maxTokens || 2500);
+    if ($('playSetImageModel')) {
+      $('playSetImageModel').value = playState.imageGenerationModel || 'anime';
+    }
+  }
+
+  function openPlaySettingsModal() {
+    fillPlaySettingsForm();
+    if ($('playSettingsModal')) $('playSettingsModal').hidden = false;
+  }
+
+  function closePlaySettingsModal() {
+    if ($('playSettingsModal')) $('playSettingsModal').hidden = true;
+  }
+
+  async function savePlaySettingsModal() {
+    var highlight = !!($('playSetHighlight') && $('playSetHighlight').checked);
+    var classic = !!($('playSetClassic') && $('playSetClassic').checked);
+    playState.enableHighlight = highlight;
+    playState.classicUi = classic;
+    try {
+      localStorage.setItem('chat_enable_highlight', highlight ? 'true' : 'false');
+      localStorage.setItem('dzmm.playClassicUi', classic ? 'true' : 'false');
+    } catch (_) {}
+    applyPlayPanelChrome();
+
+    var title = ($('playSetTitle') && $('playSetTitle').value.trim()) || '会话';
+    var style = ($('playSetStyle') && $('playSetStyle').value) || 'standard';
+    var maxTokens = parseInt(($('playSetMaxTokens') && $('playSetMaxTokens').value) || '2500', 10);
+    if (isNaN(maxTokens) || maxTokens < 0) maxTokens = 2500;
+    var imageModel = ($('playSetImageModel') && $('playSetImageModel').value) || 'anime';
+
+    playState.title = title;
+    playState.style = style;
+    playState.maxTokens = maxTokens;
+    playState.imageGenerationModel = imageModel;
+
+    if (playState.chatId) {
+      setBusy(true);
+      try {
+        var res = await patchPlaySettings({
+          title: title,
+          style: style,
+          maxTokens: maxTokens,
+          imageGenerationModel: imageModel,
+        });
+        if (!res || !res.ok) {
+          showMsg((res && res.error) || '设置保存失败', false);
+          return;
+        }
+        showMsg('会话设置已保存', true);
+      } catch (e) {
+        showMsg(String(e.message || e), false);
+        return;
+      } finally {
+        setBusy(false);
+      }
+    }
+    renderPlayMessages();
+    closePlaySettingsModal();
+  }
+
+  function renderPlayMessages() {
+    var box = $('playMessages');
+    if (!box) return;
+    box.innerHTML = '';
+    var charLabel = playCharName();
+    var userLabel = playUserName();
+    (playState.messages || []).forEach(function (m) {
+      var div = document.createElement('div');
+      var role = m.role === 'user' ? 'user' : 'assistant';
+      div.className = 'play-msg ' + role + (m.streaming ? ' streaming' : '');
+      var label = document.createElement('span');
+      label.className = 'play-role';
+      label.textContent = role === 'user' ? userLabel : charLabel;
+      div.appendChild(label);
+      var body = document.createElement('div');
+      body.className = 'play-msg-body';
+      appendPlayFormatted(body, applyPlayMacros(m.content || ''));
+      div.appendChild(body);
+      box.appendChild(div);
+    });
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function renderPlaySuggest(replies) {
+    var wrap = $('playSuggest');
+    if (!wrap) return;
+    wrap.innerHTML = '';
+    var list = Array.isArray(replies) ? replies : [];
+    if (!list.length) {
+      wrap.hidden = true;
+      return;
+    }
+    wrap.hidden = false;
+    list.slice(0, 5).forEach(function (r) {
+      var text = typeof r === 'string' ? r : (r && (r.content || r.text)) || '';
+      if (!text) return;
+      var shown = applyPlayMacros(text);
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = shown;
+      b.addEventListener('click', function () {
+        if ($('playInput')) $('playInput').value = shown;
+        sendPlayMessage();
+      });
+      wrap.appendChild(b);
+    });
+  }
+
+  async function enterCardPlay() {
+    var cardId = currentCloudCardId();
+    if (!cardId) {
+      showMsg('请先「保存到云端」得到正式卡，再试玩（草稿不可用）', false);
+      return;
+    }
+    setBusy(true);
+    showMsg('正在创建平台会话…', true);
+    try {
+      setCardPlayMode(true);
+      readLocalPlayPrefs();
+      applyPlayPanelChrome();
+      await loadPlayControls();
+      if (!playState.charName) {
+        playState.charName =
+          ($('cardName') && $('cardName').value.trim()) ||
+          ($('cardFolderName') && $('cardFolderName').value.trim()) ||
+          '';
+      }
+      updatePlayUserLabel();
+      // 同卡续聊
+      if (playState.chatId && playState.cardId === cardId) {
+        try {
+          var contSet = await api('/api/card/play/settings?chatId=' + encodeURIComponent(playState.chatId));
+          if (contSet.ok) applyPlayChatSettings(contSet.settings || {});
+        } catch (_) {}
+        renderPlayMessages();
+        if ($('playStatus')) $('playStatus').textContent = '继续会话';
+        showMsg('已进入试玩（沿用会话）', true);
+        return;
+      }
+      var meta = await api('/api/card/play/meta?cardId=' + encodeURIComponent(cardId));
+      var historyIndex = null;
+      if (meta.ok && meta.preview && meta.preview.chatHistoryIndex != null) {
+        historyIndex = meta.preview.chatHistoryIndex;
+      }
+      playState.charName =
+        (meta.ok && meta.forChat && meta.forChat.name) ||
+        ($('cardName') && $('cardName').value.trim()) ||
+        ($('cardFolderName') && $('cardFolderName').value.trim()) ||
+        '';
+      updatePlayUserLabel();
+      var start = await api('/api/card/play/start', {
+        method: 'POST',
+        body: JSON.stringify({ cardId: cardId, chatHistoryIndex: historyIndex }),
+      });
+      if (!start.ok) {
+        setCardPlayMode(false);
+        showMsg(start.error || '创建会话失败', false);
+        return;
+      }
+      playState.chatId = start.chatId;
+      playState.cardId = cardId;
+      playState.messages = Array.isArray(start.messages) ? start.messages.slice() : [];
+      if (start.settings) applyPlayChatSettings(start.settings);
+      // 若会话尚无消息，用 quick preview 开场
+      if (!playState.messages.length && meta.ok && meta.preview && meta.preview.firstMessage) {
+        playState.messages.push({ role: 'assistant', content: meta.preview.firstMessage });
+      }
+      renderPlayMessages();
+      renderPlaySuggest(
+        (meta.ok && meta.preview && meta.preview.suggestedReplies) ||
+        (meta.ok && meta.forChat && meta.forChat.suggestedReplies) ||
+        []
+      );
+      if ($('playStatus')) $('playStatus').textContent = '会话已创建';
+      showMsg('试玩已开始 · chat=' + String(start.chatId).slice(0, 10) + '…', true);
+    } catch (e) {
+      setCardPlayMode(false);
+      showMsg(String(e.message || e), false);
+    } finally {
+      setBusy(false);
+      updatePlayGate();
+    }
+  }
+
+  function parsePlaySseBuffer(buf, onEvent) {
+    var parts = buf.split('\n');
+    var rest = parts.pop() || '';
+    parts.forEach(function (line) {
+      line = line.replace(/\r$/, '');
+      if (!line.startsWith('data: ')) return;
+      try {
+        var obj = JSON.parse(line.slice(6));
+        onEvent(obj);
+      } catch (_) {}
+    });
+    return rest;
+  }
+
+  async function sendPlayMessage(textOverride) {
+    if (playState.sending) return;
+    var text = (textOverride != null ? textOverride : (($('playInput') && $('playInput').value) || '')).trim();
+    if (!text) return;
+    if (!playState.chatId || !playState.cardId) {
+      showMsg('会话未就绪，请重新点试玩', false);
+      return;
+    }
+    playState.sending = true;
+    if ($('playSendBtn')) $('playSendBtn').disabled = true;
+    if ($('playInput')) $('playInput').value = '';
+    playState.messages.push({ role: 'user', content: text });
+    var aiMsg = { role: 'assistant', content: '', streaming: true };
+    playState.messages.push(aiMsg);
+    renderPlayMessages();
+    if ($('playStatus')) $('playStatus').textContent = '生成中…';
+    if ($('playSuggest')) $('playSuggest').hidden = true;
+
+    var prompts = playState.messages.slice(0, -1).map(function (m) {
+      return { role: m.role === 'user' ? 'user' : 'assistant', content: m.content || '' };
+    });
+    var deep = !!($('playDeepThinking') && $('playDeepThinking').checked);
+    var mem = !!($('playMemoryEnhance') && $('playMemoryEnhance').checked);
+    var body = {
+      chatId: playState.chatId,
+      cardId: playState.cardId,
+      content: text,
+      // 上下文长度体现在 model internalName；maxTokens = 最大回复 Token（设置里可改）
+      model: playState.selectedModel || playState.defaultModel || '',
+      maxTokens: playState.maxTokens || (deep ? 3500 : 2500),
+      deepThinking: deep,
+      enableMemoryEnhance: mem,
+      style: playState.style || 'standard',
+      imageGenerationModel: playState.imageGenerationModel || 'anime',
+      presetIds: selectedPresetIds(),
+      playerInfo: playUserName(),
+      prompts: prompts,
+    };
+
+    try {
+      var res = await fetch('/api/card/play/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        var errText = await res.text();
+        var errMsg = errText;
+        try {
+          var ej = JSON.parse(errText);
+          errMsg = ej.error || ej.message || errText;
+        } catch (_) {}
+        aiMsg.content = '（生成失败）' + errMsg;
+        aiMsg.streaming = false;
+        renderPlayMessages();
+        showMsg(String(errMsg).slice(0, 200), false);
+        return;
+      }
+      var reader = res.body && res.body.getReader ? res.body.getReader() : null;
+      if (!reader) {
+        var raw = await res.text();
+        aiMsg.content = raw || '（空响应）';
+        aiMsg.streaming = false;
+        renderPlayMessages();
+        return;
+      }
+      var dec = new TextDecoder();
+      var buf = '';
+      var content = '';
+      while (true) {
+        var step = await reader.read();
+        if (step.done) break;
+        buf += dec.decode(step.value, { stream: true });
+        buf = parsePlaySseBuffer(buf, function (obj) {
+          var typ = obj && obj.type;
+          var data = obj && obj.data;
+          if (typ === 'token') {
+            var chunk = typeof data === 'string' ? data : '';
+            content += chunk;
+            aiMsg.content = content;
+            renderPlayMessages();
+          } else if (typ === 'step' && data && data.content != null) {
+            content = String(data.content);
+            aiMsg.content = content;
+            renderPlayMessages();
+          } else if (typ === 'complete') {
+            if (data && data.content != null) content = String(data.content);
+            else if (data && data.message != null) content = String(data.message);
+            aiMsg.content = content || aiMsg.content;
+            aiMsg.streaming = false;
+            renderPlayMessages();
+          } else if (typ === 'error') {
+            var msg = (data && (data.message || data.error)) || '生成错误';
+            aiMsg.content = (content ? content + '\n' : '') + '（错误）' + msg;
+            aiMsg.streaming = false;
+            renderPlayMessages();
+            showMsg(String(msg).slice(0, 200), false);
+          }
+        });
+      }
+      // 尾部
+      if (buf) {
+        parsePlaySseBuffer(buf + '\n', function () {});
+      }
+      aiMsg.streaming = false;
+      if (!aiMsg.content) aiMsg.content = '（无内容）';
+      renderPlayMessages();
+      if ($('playStatus')) $('playStatus').textContent = '就绪';
+    } catch (e) {
+      aiMsg.content = '（网络错误）' + String(e.message || e);
+      aiMsg.streaming = false;
+      renderPlayMessages();
+      showMsg(String(e.message || e), false);
+    } finally {
+      playState.sending = false;
+      if ($('playSendBtn')) $('playSendBtn').disabled = false;
+    }
+  }
+
+  if ($('cardPlayBtn')) $('cardPlayBtn').addEventListener('click', enterCardPlay);
+  if ($('cardPlayBackBtn')) {
+    $('cardPlayBackBtn').addEventListener('click', function () {
+      exitCardPlay({ keepSession: true });
+    });
+  }
+  if ($('playModelSelect')) {
+    $('playModelSelect').addEventListener('change', onPlayModelGroupChange);
+  }
+  if ($('playRefreshMetaBtn')) {
+    $('playRefreshMetaBtn').addEventListener('click', function () { loadPlayControls(); });
+  }
+  if ($('playPresetBtn')) {
+    $('playPresetBtn').addEventListener('click', openPlayPresetModal);
+  }
+  if ($('playSettingsBtn')) {
+    $('playSettingsBtn').addEventListener('click', openPlaySettingsModal);
+  }
+  if ($('playSettingsCloseBtn')) {
+    $('playSettingsCloseBtn').addEventListener('click', closePlaySettingsModal);
+  }
+  if ($('playSettingsApplyBtn')) {
+    $('playSettingsApplyBtn').addEventListener('click', function () { savePlaySettingsModal(); });
+  }
+  if ($('playSettingsModal')) {
+    $('playSettingsModal').addEventListener('click', function (e) {
+      if (e.target === $('playSettingsModal')) closePlaySettingsModal();
+    });
+  }
+  if ($('playDeepThinking')) {
+    $('playDeepThinking').addEventListener('change', function () {
+      var on = !!$('playDeepThinking').checked;
+      // 官网：切换深度思考时同步 maxTokens 3500/2500
+      playState.maxTokens = on ? 3500 : 2500;
+      if (playState.chatId) {
+        patchPlaySettings({ deepThinking: on, maxTokens: playState.maxTokens }).catch(function () {});
+      }
+    });
+  }
+  if ($('playMemoryEnhance')) {
+    $('playMemoryEnhance').addEventListener('change', function () {
+      if (!playState.chatId) return;
+      patchPlaySettings({
+        enableMemoryEnhance: !!$('playMemoryEnhance').checked,
+      }).catch(function () {});
+    });
+  }
+  if ($('playPresetCloseBtn')) {
+    $('playPresetCloseBtn').addEventListener('click', closePlayPresetModal);
+  }
+  if ($('playPresetApplyBtn')) {
+    $('playPresetApplyBtn').addEventListener('click', applyPlayPresetModal);
+  }
+  if ($('playPresetClearBtn')) {
+    $('playPresetClearBtn').addEventListener('click', function () {
+      var list = $('playPresetList');
+      if (!list) return;
+      list.querySelectorAll('input[type="checkbox"]').forEach(function (cb) { cb.checked = false; });
+    });
+  }
+  if ($('playPresetModal')) {
+    $('playPresetModal').addEventListener('click', function (e) {
+      if (e.target === $('playPresetModal')) closePlayPresetModal();
+    });
+  }
+  if ($('playSendBtn')) $('playSendBtn').addEventListener('click', function () { sendPlayMessage(); });
+  if ($('playInput')) {
+    $('playInput').addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {
+        ev.preventDefault();
+        sendPlayMessage();
+      }
+    });
+  }
+  updatePlayGate();
   if ($('cardDeleteLocalBtn')) {
     $('cardDeleteLocalBtn').addEventListener('click', function () {
       var id = currentCardLocalId();
@@ -2367,12 +3557,25 @@
     if (!el) return;
     el.addEventListener('click', function () {
       cloudCardFilter = mode;
-      renderCloudCardList();
+      renderCloudCardList({ resetPage: true });
+      var sc = $('cloudCardListScroll');
+      if (sc) sc.scrollTop = 0;
     });
   }
   bindCloudFilter('cardCloudFilterAll', 'all');
   bindCloudFilter('cardCloudFilterDraft', 'draft');
   bindCloudFilter('cardCloudFilterPub', 'pub');
+  if ($('cardCloudSearch')) {
+    $('cardCloudSearch').addEventListener('input', function () {
+      cloudCardSearch = $('cardCloudSearch').value || '';
+      if (cloudSearchTimer) clearTimeout(cloudSearchTimer);
+      cloudSearchTimer = setTimeout(function () {
+        renderCloudCardList({ resetPage: true });
+        var sc = $('cloudCardListScroll');
+        if (sc) sc.scrollTop = 0;
+      }, 120);
+    });
+  }
 
   try {
     if (localStorage.getItem(SIDEBAR_KEY) === '1') setSidebarCollapsed(true);
@@ -2382,12 +3585,25 @@
   }
   setFabProgress(0, 'idle');
 
+  // 刷新后内存态丢失：强制退出试玩叠层，避免空表单+试玩条并存
+  setCardPlayMode(false);
   try {
     var savedMode = localStorage.getItem(CONSOLE_MODE_KEY);
+    var savedCardId = '';
+    try { savedCardId = localStorage.getItem(CONSOLE_CARD_KEY) || ''; } catch (_) {}
     if (savedMode === 'card' || savedMode === 'game') {
       switchConsoleMode(savedMode);
+    } else {
+      // 首次使用：游戏卡 + 账号登录
+      switchConsoleMode('game', { panel: 'login' });
     }
-  } catch (_) {}
+    // 角色卡模式：恢复上次打开的卡夹（刷新后不再是空白错误页）
+    if ((savedMode === 'card' || consoleMode === 'card') && savedCardId) {
+      openLocalCard(savedCardId).catch(function () {});
+    }
+  } catch (_) {
+    switchConsoleMode('game', { panel: 'login' });
+  }
 
   document.addEventListener('keydown', function (ev) {
     if (ev.key === 'Escape' && isSidebarCollapsed()) {

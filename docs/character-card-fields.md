@@ -1,6 +1,8 @@
 # DZMM 平台写卡：填写项与分类（对照 studio/edit）
 
-来源：前端包 `D4_csDye.js` i18n / 校验 / 默认 `rawData` 结构反查。
+来源：前端包 i18n / 校验 / 默认 `rawData` 结构反查。
+
+**各框「怎么写」**（官网帮助文案与占位示例）：见 `docs/character-card-writing-guide.md`。
 
 ## 向导模式
 
@@ -21,12 +23,12 @@
 
 | 界面组件 | JSON 字段 | 说明 |
 | --- | --- | --- |
-| 角色名 | `data.name` | 必填 |
-| 角色简介/描述 | `data.description` | 外貌身份背景等 |
-| 性格 | `data.personality` | 模板提示含特质/行为/情绪等 |
-| 场景 | `data.scenario` | 开场处境与环境 |
-| 系统指令 | `data.system_prompt` | 行为规则、立场、知识范围等 |
-| 创作者备注 | `data.creator_notes` | 给人看的说明（可含玩法/版本） |
+| 角色名 | `data.name` | 必填；影响人设与 AI 自我认知 |
+| 详细描述 | `data.description` | 背景、经历、能力、关系等 |
+| 性格 | `data.personality` | 特质/情感/人际/价值观/行为等 |
+| 场景 | `data.scenario` | 环境、氛围、时间、位置 |
+| 系统指令 | `data.system_prompt` | 可执行的扮演规则 |
+| 角色卡介绍 | `data.creator_notes` | 给人看；**AI 不可见** |
 | 标签 | `data.tags[]` | |
 | 创作者 | `data.creator` | |
 | 版本 | `data.character_version` | |

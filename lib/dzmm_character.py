@@ -8,18 +8,26 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import re
 import shutil
+import struct
 import time
 import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import dzmm_studio as studio
+
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover
+    Image = None  # type: ignore
 
 _FLIGHT_BOOL = {"!0": True, "!1": False, "true": True, "false": False}
 _PENDING_STATUSES = frozenset({"pending", "pending_notified"})
@@ -35,7 +43,51 @@ _AVATAR_MIME = {
 
 KIT_ROOT = Path(__file__).resolve().parents[1]
 CARDS_DIR = KIT_ROOT / "卡"
+TEMPLATE_DIR = KIT_ROOT / "_模板"
+CHAT_PROMPT_PATH = TEMPLATE_DIR / "开聊提示词.txt"
 ORIGIN = studio.ORIGIN
+
+
+def build_chat_prompt(name: str = "", brief: str = "") -> dict:
+    """读取根目录 `_模板/开聊提示词.txt`，用当前卡名/简述填好占位，便于一键复制。"""
+    if not CHAT_PROMPT_PATH.is_file():
+        raise FileNotFoundError(f"找不到开聊提示词：{CHAT_PROMPT_PATH}")
+    text = CHAT_PROMPT_PATH.read_text(encoding="utf-8").replace("\r\n", "\n")
+    name = (name or "").strip()
+    brief = (brief or "").strip()
+    if name:
+        # 路径占位优先，再替卡名文案
+        text = text.replace("卡/<卡名>/", f"卡/{name}/")
+        text = re.sub(r"卡/<[^>\n]+>/", f"卡/{name}/", text)
+        text = text.replace("这里写卡名", name)
+        text = text.replace("<卡名>", name)
+        text = text.replace("「卡名」", f"「{name}」")
+        # 旧模板没有【任务】句时补一句，避免 AI 不知道写哪张
+        if f"现在开始创作角色卡「{name}」" not in text:
+            text = (
+                f"【任务】现在开始创作角色卡「{name}」。\n"
+                f"目标目录：卡/{name}/\n\n"
+                + text
+            )
+    if brief:
+        # 覆盖「（这里写创意简述…）」整段括号，或单独占位句
+        text = re.sub(
+            r"（这里写创意简述[^）]*）",
+            brief,
+            text,
+            count=1,
+        )
+        if "这里写创意简述" in text:
+            text = text.replace("这里写创意简述：定位、时代/场景、关系与冲突、语气与尺度", brief)
+            text = text.replace("这里写创意简述", brief)
+    return {
+        "text": text.strip() + "\n",
+        "path": str(CHAT_PROMPT_PATH),
+        "name": name,
+        "brief": brief,
+        "filledName": bool(name),
+        "filledBrief": bool(brief),
+    }
 
 # 基础文本字段 → 文件名
 BASIC_TXT = (
@@ -52,6 +104,16 @@ BASIC_TXT = (
     "brief",
     "avatar_url",
 )
+
+
+def _is_user_card_dir(path: Path) -> bool:
+    """是否为用户角色卡夹（排除隐藏目录与 _模板 等下划线前缀目录）。"""
+    if not path.is_dir():
+        return False
+    name = path.name
+    if not name or name.startswith(".") or name.startswith("_"):
+        return False
+    return True
 
 
 def cards_root() -> Path:
@@ -110,6 +172,8 @@ def _card_dir(local_id: str) -> Path:
     local_id = _safe_folder_name(local_id)
     if not local_id or local_id in (".", "..") or "/" in local_id or "\\" in local_id:
         raise ValueError("无效卡名/文件夹")
+    if local_id.startswith(".") or local_id.startswith("_"):
+        raise ValueError("卡名不能以 . 或 _ 开头（保留给模板/系统目录）")
     return cards_root() / local_id
 
 
@@ -446,9 +510,13 @@ def write_folder(card: dict, local_id: str | None = None, *, brief: str | None =
     if not isinstance(card, dict) or not isinstance(card.get("data"), dict):
         raise ValueError("卡必须是对象")
     data = card["data"]
-    name = str(data.get("name") or local_id or "未命名角色").strip() or "未命名角色"
+    # 允许显式空名称（空白新建）；文件夹名仍由 local_id 决定
+    if data.get("name") is None and local_id:
+        name = _safe_folder_name(local_id)
+    else:
+        name = str(data.get("name") or "").strip()
     data["name"] = name
-    folder_name = _safe_folder_name(local_id or name)
+    folder_name = _safe_folder_name(local_id or name or "未命名角色")
     d = _card_dir(folder_name)
     d.mkdir(parents=True, exist_ok=True)
 
@@ -512,40 +580,72 @@ def write_folder(card: dict, local_id: str | None = None, *, brief: str | None =
     _write_json(d / "card.json", card)
 
     readme = d / "README.md"
-    readme.write_text(
-        "# 本地角色卡（对齐平台写卡分类）\n\n"
-        "## 基础 basic\n"
-        "- `name.txt` `description.txt` `personality.txt` `scenario.txt`\n"
-        "- `system_prompt.txt` `creator_notes.txt` `tags.txt` `creator.txt` `character_version.txt`\n"
-        "- `first_mes.txt` `brief.txt` `avatar_url.txt`\n\n"
-        "## 世界书 worldbook\n"
-        "- `character_book/name.txt`\n"
-        "- `character_book/entries/001/`：`name.txt` `keys.txt` `content.txt` "
-        "`enabled.txt` `constant.txt` `comment.txt` …\n\n"
-        "## 对话 dialogue\n"
-        "- `chat_history.json`\n"
-        "- `suggested_replies.txt`（一行一条）\n\n"
-        "## 图片 / 音色\n"
-        "- `image_info.json` `voice_settings.json`\n\n"
-        "编辑本目录文件后，控制台网页会实时同步。\n",
-        encoding="utf-8",
-    )
+    if not readme.exists():
+        readme.write_text(
+            "# 本地角色卡\n\n"
+            "写卡规范与顺序（无记忆时必读）：仓库根目录 `_模板/`\n\n"
+            "- Agent 入口：`_模板/AGENTS.md`\n"
+            "- 填写顺序：`_模板/填写顺序.md`\n"
+            "- 写作规范：`_模板/写作规范.md`\n\n"
+            "## 本夹文件\n\n"
+            "## 基础 basic\n"
+            "- `name.txt` `description.txt` `personality.txt` `scenario.txt`\n"
+            "- `system_prompt.txt` `creator_notes.txt` `tags.txt` "
+            "`creator.txt` `character_version.txt`\n"
+            "- `first_mes.txt` `brief.txt` `avatar_url.txt`\n\n"
+            "## 世界书 worldbook\n"
+            "- `character_book/name.txt`\n"
+            "- `character_book/entries/001/`：`name.txt` `keys.txt` `content.txt` "
+            "`enabled.txt` `constant.txt` `comment.txt` …\n\n"
+            "## 对话 dialogue\n"
+            "- `chat_history.json`\n"
+            "- `suggested_replies.txt`（一行一条）\n\n"
+            "## 图片 / 音色\n"
+            "- `image_info.json` `voice_settings.json`\n\n"
+            "编辑本目录文件后，控制台网页会实时同步。\n",
+            encoding="utf-8",
+        )
     return {"localId": folder_name, "path": str(d), "card": card, "mtime": meta["mtime"], "folder": str(d)}
 
 
-def create_local(name: str = "未命名角色", brief: str = "") -> dict:
-    name = _safe_folder_name(name)
-    card = empty_card(name)
-    if brief:
-        card["_meta"]["brief"] = brief
-    return write_folder(card, local_id=name, brief=brief)
+def _unique_local_id(base: str) -> str:
+    """避免新建覆盖已有卡夹：未命名角色 → 未命名角色-2 …"""
+    base = _safe_folder_name(base)
+    if not _card_dir(base).exists():
+        return base
+    for i in range(2, 1000):
+        cand = _safe_folder_name(f"{base}-{i}")
+        if not _card_dir(cand).exists():
+            return cand
+    raise RuntimeError(f"无法分配唯一卡夹名：{base}")
+
+
+def create_local(name: str = "未命名角色", brief: str = "", *, blank: bool = False) -> dict:
+    """
+    新建本地卡夹。
+    blank=True：内容字段留空（简述等），但必须带卡名；文件夹按卡名分配唯一目录。
+    """
+    display = (name or "").strip()
+    if not display:
+        raise ValueError("必须填写卡名")
+    folder_base = _safe_folder_name(display)
+    folder = _unique_local_id(folder_base)
+    if blank:
+        card = empty_card(display)
+        card["data"]["name"] = display
+        brief = ""
+    else:
+        card = empty_card(display)
+        if brief:
+            card["_meta"]["brief"] = brief
+    return write_folder(card, local_id=folder, brief=str(brief or ""))
 
 
 def list_local_cards() -> list[dict]:
     root = cards_root()
     items = []
     for path in sorted(root.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-        if not path.is_dir() or path.name.startswith("."):
+        if not _is_user_card_dir(path):
             continue
         try:
             card = load_from_folder(path.name)
@@ -1085,8 +1185,11 @@ def _sync_local_listing_meta(cloud_id: int, *, status: dict, name_hint: str = ""
         return
 
 
-def list_cloud_cards() -> list[dict]:
-    """拉取创作侧全部角色/草稿，并补齐广场上架状态（isPublic / 审核中）。"""
+def list_cloud_cards(*, enrich_listing: bool = True) -> list[dict]:
+    """
+    拉取创作侧全部角色/草稿。
+    enrich_listing=False：只拉列表（供控制台轮询），不逐卡查广场上架状态。
+    """
     out: list[dict] = []
     seen: set[tuple] = set()
     cursor = None
@@ -1112,6 +1215,9 @@ def list_cloud_cards() -> list[dict]:
         cursor = data.get("nextCursor")
         if not cursor:
             break
+
+    if not enrich_listing:
+        return out
 
     game_map = _game_stats_public_map()
     need_page: list[int] = []
@@ -1172,6 +1278,169 @@ def delete_local_card(local_id: str) -> dict:
         raise FileNotFoundError(f"本地卡夹不存在: {local_id}")
     shutil.rmtree(d)
     return {"localId": local_id, "deleted": True, "path": str(d)}
+
+
+def _png_chunk(tag: bytes, data: bytes) -> bytes:
+    crc = zlib.crc32(tag + data) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+
+
+def _png_embed_text_chunks(png_bytes: bytes, texts: dict[str, str]) -> bytes:
+    """在 IEND 前写入/替换 tEXt 块（SillyTavern：chara / ccv3）。"""
+    if not png_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("封面不是有效 PNG")
+    out = bytearray(png_bytes[:8])
+    pos = 8
+    drop = {k.encode("latin-1") for k in texts}
+    while pos + 8 <= len(png_bytes):
+        length = struct.unpack(">I", png_bytes[pos : pos + 4])[0]
+        tag = png_bytes[pos + 4 : pos + 8]
+        data = png_bytes[pos + 8 : pos + 8 + length]
+        nxt = pos + 12 + length
+        if tag == b"IEND":
+            for key, val in texts.items():
+                payload = key.encode("latin-1") + b"\x00" + val.encode("latin-1", "ignore")
+                out.extend(_png_chunk(b"tEXt", payload))
+            out.extend(png_bytes[pos:nxt])
+            break
+        if tag == b"tEXt":
+            nul = data.find(b"\x00")
+            key = data[:nul] if nul >= 0 else data
+            if key in drop:
+                pos = nxt
+                continue
+        out.extend(png_bytes[pos:nxt])
+        pos = nxt
+    else:
+        raise ValueError("PNG 缺少 IEND")
+    return bytes(out)
+
+
+def _cover_url_candidates(card: dict) -> list[str]:
+    data = card.get("data") if isinstance(card.get("data"), dict) else {}
+    urls: list[str] = []
+    images = data.get("image_info") if isinstance(data.get("image_info"), list) else []
+    for it in images:
+        if isinstance(it, dict):
+            u = str(it.get("url") or "").strip()
+            if u:
+                urls.append(u)
+    av = str(data.get("avatar_url") or "").strip()
+    if av:
+        urls.append(av)
+    # 去重保序
+    seen: set[str] = set()
+    out: list[str] = []
+    for u in urls:
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
+
+
+def _load_cover_bytes(local_id: str, url: str) -> bytes:
+    url = (url or "").strip()
+    if not url:
+        raise ValueError("空封面地址")
+    d = _card_dir(local_id)
+    if _is_local_asset_url(url):
+        p = resolve_card_asset(local_id, url)
+        return p.read_bytes()
+    # 相对 assets
+    if not url.startswith("http://") and not url.startswith("https://"):
+        rel = url.replace("\\", "/").lstrip("/")
+        if ".." in rel.split("/"):
+            raise ValueError("非法本地路径")
+        p = (d / rel).resolve()
+        if not str(p).startswith(str(d.resolve())) or not p.is_file():
+            raise FileNotFoundError(f"封面不存在: {url}")
+        return p.read_bytes()
+    req = urllib.request.Request(url, headers={"User-Agent": "dzmm-local-dev/card-export"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.read()
+
+
+def _bytes_to_cover_png(raw: bytes, *, max_side: int = 1024) -> bytes:
+    if Image is None:
+        if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            return raw
+        raise RuntimeError("需要 Pillow 才能把非 PNG 封面转成卡图")
+    im = Image.open(io.BytesIO(raw))
+    im = im.convert("RGBA")
+    w, h = im.size
+    scale = min(1.0, float(max_side) / float(max(w, h) or 1))
+    if scale < 1.0:
+        im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    im.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _placeholder_cover_png(title: str = "card") -> bytes:
+    if Image is None:
+        # 1x1 PNG
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+            + _png_chunk(b"IDAT", zlib.compress(b"\x00\x00\x00"))
+            + _png_chunk(b"IEND", b"")
+        )
+    im = Image.new("RGB", (768, 1024), (232, 224, 214))
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def export_card_png(local_id: str, *, save_copy: bool = True) -> dict:
+    """
+    打包为 SillyTavern 兼容 PNG 角色卡：
+    封面优先 image_info 第一张，其次 avatar_url；写入 tEXt chara + ccv3。
+    """
+    local_id = _safe_folder_name(local_id)
+    card = load_from_folder(local_id)
+    data = card.get("data") if isinstance(card.get("data"), dict) else {}
+    export_card = {
+        "spec": card.get("spec") or "chara_card_v3",
+        "spec_version": card.get("spec_version") or "3.0",
+        "data": json.loads(json.dumps(data)),
+    }
+    # 导出不带本地 _meta
+    payload = json.dumps(export_card, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    b64 = base64.b64encode(payload).decode("ascii")
+
+    cover_raw = None
+    cover_src = ""
+    for u in _cover_url_candidates(card):
+        try:
+            cover_raw = _load_cover_bytes(local_id, u)
+            cover_src = u
+            break
+        except Exception:
+            continue
+    if cover_raw is None:
+        cover_png = _placeholder_cover_png(str(data.get("name") or local_id))
+        cover_src = "(placeholder)"
+    else:
+        cover_png = _bytes_to_cover_png(cover_raw)
+
+    png = _png_embed_text_chunks(cover_png, {"ccv3": b64, "chara": b64})
+    safe_name = _safe_folder_name(str(data.get("name") or local_id))
+    filename = f"{safe_name}.png"
+    out_path = None
+    if save_copy:
+        export_dir = _card_dir(local_id) / "export"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        out_path = export_dir / filename
+        out_path.write_bytes(png)
+    return {
+        "localId": local_id,
+        "filename": filename,
+        "bytes": png,
+        "size": len(png),
+        "coverSrc": cover_src,
+        "path": str(out_path) if out_path else "",
+    }
 
 
 def delete_cloud_draft(draft_id: int) -> dict:
@@ -1637,7 +1906,7 @@ def _find_local_id_by_cloud_id(cloud_id: int) -> str | None:
     if not root.is_dir():
         return None
     for path in root.iterdir():
-        if not path.is_dir() or path.name.startswith("."):
+        if not _is_user_card_dir(path):
             continue
         try:
             card = load_from_folder(path.name)
@@ -1719,3 +1988,339 @@ def shelf_cloud_card(card_id: int, *, listed: bool = True, local_id: str | None 
             }
         )
     return out
+
+
+# ---------------------------------------------------------------------------
+# 试玩（平台对话）：createByCard + /api/chat 流式生成
+# ---------------------------------------------------------------------------
+
+
+def _chat_http(
+    url: str,
+    *,
+    method: str = "GET",
+    data: dict | None = None,
+    raw_body: bytes | None = None,
+    accept: str = "application/json",
+    timeout: int = 180,
+    stream: bool = False,
+):
+    """角色聊天用 HTTP；Referer 指向 /chat。stream=True 时返回 (status, response, headers)。"""
+    cookie, token, _, _ = studio.load_auth(min_remain=30)
+    headers = {
+        "Cookie": cookie,
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "Mozilla/5.0 DZMM-Local-Card-Play",
+        "Accept": accept,
+        "Referer": f"{ORIGIN}/chat",
+        "Origin": ORIGIN,
+        "x-dzmm-request-id": f"cardplay{int(time.time()) % 10_000_000}",
+    }
+    body = None
+    if raw_body is not None:
+        body = raw_body
+        headers["Content-Type"] = "application/json"
+    elif data is not None:
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        if stream:
+            return resp.status, resp, dict(resp.headers)
+        raw = resp.read()
+        return resp.status, raw, dict(resp.headers)
+    except urllib.error.HTTPError as e:
+        if stream:
+            # 仍返回可读 body，由调用方决定
+            return e.code, e, dict(e.headers)
+        return e.code, e.read(), dict(e.headers)
+
+
+def play_meta(card_id: int) -> dict:
+    """聊天用卡摘要 + 开场预览。"""
+    card_id = int(card_id)
+    if card_id <= 0:
+        raise ValueError("需要有效的云端 cardId（已保存正式卡）")
+    for_chat = _trpc_get("card.getForChat", {"cardId": card_id})
+    preview: dict = {}
+    try:
+        preview = _trpc_get("card.getQuickChatPreview", {"cardId": card_id}) or {}
+    except Exception:
+        preview = {}
+    return {
+        "cardId": card_id,
+        "forChat": for_chat if isinstance(for_chat, dict) else {},
+        "preview": preview if isinstance(preview, dict) else {},
+    }
+
+
+def play_start(card_id: int, chat_history_index: int | None = None) -> dict:
+    """创建平台会话，返回 chatId。"""
+    card_id = int(card_id)
+    if card_id <= 0:
+        raise ValueError("需要有效的云端 cardId")
+    # entryPoint 必须是平台枚举：card_detail|home|search|recommendation|
+    # home_newbie|chat_list|share_link|quick_chat|profile|checkpoint|
+    # telegram|summon|import|general_chat|other
+    payload: dict = {"cardId": card_id, "entryPoint": "quick_chat"}
+    if chat_history_index is not None:
+        try:
+            payload["fixedRandomIndex"] = int(chat_history_index)
+        except (TypeError, ValueError):
+            pass
+    result = _trpc_post("chat.createByCard", payload)
+    chat_id = result.get("chatId") or result.get("value")
+    if not chat_id:
+        raise RuntimeError(f"createByCard 未返回 chatId: {result}")
+    return {"chatId": str(chat_id), "cardId": card_id}
+
+
+def play_models() -> dict:
+    """角色聊天模型列表（service=chat）。"""
+    data = _trpc_get("chat.models", {"service": "chat"})
+    return data if isinstance(data, dict) else {"raw": data}
+
+
+def play_me() -> dict:
+    """登录用户资料；{{user}} 显示名取 fullName（与官网一致，非邮箱）。"""
+    data = _trpc_get("user.getMe", {})
+    if not isinstance(data, dict):
+        return {"displayName": "", "raw": data}
+    full = str(data.get("fullName") or data.get("name") or "").strip()
+    return {
+        "displayName": full[:40] if full else "",
+        "avatarUrl": str(data.get("avatarUrl") or "").strip(),
+        "id": str(data.get("id") or ""),
+    }
+
+
+def play_presets() -> dict:
+    """账号预设列表 + 当前激活项 + 登录显示名。"""
+    data = _trpc_get("preset.list", {})
+    if not isinstance(data, dict):
+        data = {}
+    settings = data.get("settings") if isinstance(data.get("settings"), dict) else {}
+    presets = data.get("presets") if isinstance(data.get("presets"), list) else []
+    me: dict = {}
+    try:
+        me = play_me()
+    except Exception:
+        me = {"displayName": ""}
+    return {
+        "presets": presets,
+        "settings": settings,
+        "activePresetIds": settings.get("activePresetIds")
+        or ([settings["activePresetId"]] if settings.get("activePresetId") else []),
+        "playerInfo": settings.get("playerInfo") or "",
+        "displayName": (me.get("displayName") or "").strip(),
+    }
+
+
+def play_messages(chat_id: str) -> dict:
+    chat_id = str(chat_id or "").strip()
+    if not chat_id:
+        raise ValueError("缺少 chatId")
+    data = _trpc_get("chat.getMessages", {"chatId": chat_id})
+    return data if isinstance(data, dict) else {"raw": data}
+
+
+def play_get_settings(chat_id: str) -> dict:
+    chat_id = str(chat_id or "").strip()
+    if not chat_id:
+        raise ValueError("缺少 chatId")
+    data = _trpc_get("chat.getSettings", {"chatId": chat_id})
+    return data if isinstance(data, dict) else {}
+
+
+def play_update_settings(chat_id: str, settings: dict) -> dict:
+    """tRPC chat.updateSettings：部分字段 patch（title/style/maxTokens/…）。"""
+    chat_id = str(chat_id or "").strip()
+    if not chat_id:
+        raise ValueError("缺少 chatId")
+    if not isinstance(settings, dict) or not settings:
+        raise ValueError("缺少 settings")
+    # 只透传官网侧栏会改的字段，避免误写
+    allow = {
+        "title",
+        "style",
+        "maxTokens",
+        "model",
+        "deepThinking",
+        "enableMemoryEnhance",
+        "imageGenerationModel",
+        "visualNovelMode",
+        "backgroundOfficial",
+        "backgroundCustom",
+        "voiceId",
+        "voiceAutoPlay",
+        "voiceOnlyQuotes",
+        "voiceIgnoreEnglish",
+        "voiceIgnoreParentheses",
+        "voiceReadAsterisks",
+        "presetOverride",
+    }
+    patch = {k: settings[k] for k in allow if k in settings}
+    if "maxTokens" in patch:
+        try:
+            patch["maxTokens"] = int(patch["maxTokens"])
+        except (TypeError, ValueError) as e:
+            raise ValueError("maxTokens 无效") from e
+    if "title" in patch:
+        patch["title"] = str(patch["title"] or "").strip() or "会话"
+    if "style" in patch:
+        style = str(patch["style"] or "standard").strip()
+        if style not in ("standard", "creative", "divergent", "apex_dry"):
+            style = "standard"
+        patch["style"] = style
+    if "imageGenerationModel" in patch:
+        img = str(patch["imageGenerationModel"] or "anime").strip()
+        if img not in ("anime", "iroha"):
+            img = "anime"
+        patch["imageGenerationModel"] = img
+    if not patch:
+        raise ValueError("没有可更新的设置字段")
+    data = _trpc_post("chat.updateSettings", {"chatId": chat_id, "settings": patch})
+    return data if isinstance(data, dict) else {"ok": True, "raw": data}
+
+
+def _flatten_play_messages(payload: dict) -> list[dict]:
+    """把 getMessages / complete 结构压成 role+content 列表。"""
+    out: list[dict] = []
+    chunks = payload.get("chunks") if isinstance(payload, dict) else None
+    if isinstance(chunks, list):
+        for ch in chunks:
+            if not isinstance(ch, dict):
+                continue
+            msgs = ch.get("messages")
+            if not isinstance(msgs, list):
+                continue
+            for m in msgs:
+                if not isinstance(m, dict):
+                    continue
+                role = str(m.get("role") or "").strip()
+                content = m.get("content")
+                if isinstance(content, list):
+                    # multimodal → 拼文本
+                    parts = []
+                    for p in content:
+                        if isinstance(p, dict) and p.get("type") == "text":
+                            parts.append(str(p.get("text") or ""))
+                        elif isinstance(p, str):
+                            parts.append(p)
+                    content = "".join(parts)
+                if role and isinstance(content, str) and content.strip():
+                    out.append({"role": role, "content": content})
+    return out
+
+
+def build_generate_body(
+    *,
+    chat_id: str,
+    card_id: int | str,
+    content: str,
+    model: str | None = None,
+    max_tokens: int | None = None,
+    deep_thinking: bool = False,
+    enable_memory_enhance: bool = False,
+    style: str | None = None,
+    image_generation_model: str | None = None,
+    preset_ids: list[str] | None = None,
+    player_info: str | None = None,
+    prompts: list[dict] | None = None,
+) -> dict:
+    # 官网：上下文长度靠 model internalName；maxTokens 为「最大回复 Token」
+    think = bool(deep_thinking)
+    chat_settings: dict = {
+        "deepThinking": think,
+        "enableMemoryEnhance": bool(enable_memory_enhance),
+        "style": str(style or "standard").strip() or "standard",
+    }
+    if model:
+        chat_settings["model"] = model
+    if max_tokens is None:
+        max_tokens = 3500 if think else 2500
+    try:
+        chat_settings["maxTokens"] = int(max_tokens)
+    except (TypeError, ValueError):
+        chat_settings["maxTokens"] = 3500 if think else 2500
+    img = str(image_generation_model or "anime").strip() or "anime"
+    if img not in ("anime", "iroha"):
+        img = "anime"
+    chat_settings["imageGenerationModel"] = img
+
+    preset_config: dict = {
+        "presetIds": [str(x) for x in (preset_ids or []) if str(x).strip()],
+    }
+    if player_info and str(player_info).strip():
+        preset_config["playerInfo"] = str(player_info).strip()
+
+    hist: list[dict] = []
+    for m in prompts or []:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "").strip()
+        text = m.get("content")
+        if role in ("user", "assistant", "ai") and isinstance(text, str):
+            hist.append({"role": "assistant" if role == "ai" else role, "content": text})
+
+    return {
+        "operation": "generate",
+        "chatId": str(chat_id),
+        "cardId": card_id,
+        "chatSettings": chat_settings,
+        "presetConfig": preset_config,
+        "prompts": hist,
+        "content": str(content or ""),
+    }
+
+
+def play_generate_request(body: dict):
+    """发起 POST /api/chat，返回 (status, response_or_error, headers)。调用方负责读流。"""
+    if not isinstance(body, dict):
+        raise ValueError("generate body 必须是对象")
+    url = f"{ORIGIN}/api/chat"
+    raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    return _chat_http(
+        url,
+        method="POST",
+        raw_body=raw,
+        accept="text/event-stream, application/json, */*",
+        timeout=300,
+        stream=True,
+    )
+
+
+def parse_sse_line(line: str, content_so_far: str = "") -> dict | None:
+    """解析一行 `data: {...}` SSE。返回 {type, ...} 或 None。"""
+    line = (line or "").strip()
+    if not line.startswith("data: "):
+        return None
+    try:
+        obj = json.loads(line[6:])
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    typ = obj.get("type")
+    data = obj.get("data")
+    if typ == "init":
+        gen = data.get("generationId") if isinstance(data, dict) else data
+        return {"type": "init", "generationId": gen}
+    if typ == "token":
+        # 平台 token.data 为增量字符串
+        chunk = data if isinstance(data, str) else (str(data) if data is not None else "")
+        return {"type": "token", "chunk": chunk, "content": content_so_far + chunk}
+    if typ == "step":
+        step_content = content_so_far
+        step_name = None
+        if isinstance(data, dict):
+            if data.get("content") is not None:
+                step_content = str(data.get("content"))
+            step_name = data.get("step")
+        return {"type": "step", "content": step_content, "step": step_name}
+    if typ == "complete":
+        return {"type": "complete", "data": data}
+    if typ == "error":
+        return {"type": "error", "data": data}
+    return {"type": typ or "unknown", "data": data}

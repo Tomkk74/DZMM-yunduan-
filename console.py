@@ -865,6 +865,198 @@ def do_card_list() -> dict:
         return {"ok": False, "error": str(e), "items": []}
 
 
+def do_card_chat_prompt(name: str = "", brief: str = "") -> dict:
+    try:
+        data = character.build_chat_prompt(name=name, brief=brief)
+        return {"ok": True, **data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_card_play_meta(card_id: int) -> dict:
+    try:
+        data = character.play_meta(int(card_id))
+        return {"ok": True, **data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_card_play_start(body: dict) -> dict:
+    try:
+        card_id = int(body.get("cardId") or 0)
+        idx = body.get("chatHistoryIndex")
+        if idx is not None and idx != "":
+            try:
+                idx = int(idx)
+            except (TypeError, ValueError):
+                idx = None
+        else:
+            idx = None
+        data = character.play_start(card_id, chat_history_index=idx)
+        # 拉首轮消息（开场）+ 会话设置
+        msgs = {}
+        try:
+            msgs = character.play_messages(data["chatId"])
+        except Exception as e:
+            msgs = {"error": str(e)}
+        settings = {}
+        try:
+            settings = character.play_get_settings(data["chatId"])
+        except Exception as e:
+            settings = {"error": str(e)}
+        flat = character._flatten_play_messages(msgs if isinstance(msgs, dict) else {})
+        return {
+            "ok": True,
+            **data,
+            "messages": flat,
+            "rawMessages": msgs,
+            "settings": settings if isinstance(settings, dict) else {},
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_card_play_models() -> dict:
+    try:
+        data = character.play_models()
+        return {"ok": True, "models": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_card_play_presets() -> dict:
+    try:
+        data = character.play_presets()
+        return {"ok": True, **data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_card_play_messages(chat_id: str) -> dict:
+    try:
+        data = character.play_messages(chat_id)
+        flat = character._flatten_play_messages(data if isinstance(data, dict) else {})
+        return {"ok": True, "messages": flat, "raw": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_card_play_settings_get(chat_id: str) -> dict:
+    try:
+        data = character.play_get_settings(chat_id)
+        return {"ok": True, "settings": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_card_play_settings_update(body: dict) -> dict:
+    try:
+        chat_id = str(body.get("chatId") or "").strip()
+        settings = body.get("settings")
+        if not isinstance(settings, dict):
+            settings = {k: v for k, v in body.items() if k != "chatId"}
+        data = character.play_update_settings(chat_id, settings)
+        # 再拉一遍最新设置
+        fresh = {}
+        try:
+            fresh = character.play_get_settings(chat_id)
+        except Exception:
+            fresh = data if isinstance(data, dict) else {}
+        return {"ok": True, "settings": fresh, "raw": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _proxy_card_play_generate(handler, body: dict) -> None:
+    """把 POST /api/chat 的 SSE 流式结果转给前端。"""
+    try:
+        chat_id = str(body.get("chatId") or "").strip()
+        card_id = body.get("cardId")
+        content = str(body.get("content") or "")
+        if not chat_id:
+            _json(handler, 400, {"ok": False, "error": "缺少 chatId"})
+            return
+        if card_id is None or card_id == "":
+            _json(handler, 400, {"ok": False, "error": "缺少 cardId"})
+            return
+        if not content.strip():
+            _json(handler, 400, {"ok": False, "error": "消息不能为空"})
+            return
+        preset_ids = body.get("presetIds")
+        if not isinstance(preset_ids, list):
+            preset_ids = []
+        prompts = body.get("prompts")
+        if not isinstance(prompts, list):
+            prompts = []
+        gen_body = character.build_generate_body(
+            chat_id=chat_id,
+            card_id=card_id,
+            content=content,
+            model=body.get("model") or None,
+            max_tokens=body.get("maxTokens"),
+            deep_thinking=bool(body.get("deepThinking")),
+            enable_memory_enhance=bool(body.get("enableMemoryEnhance")),
+            style=body.get("style") or None,
+            image_generation_model=body.get("imageGenerationModel") or None,
+            preset_ids=[str(x) for x in preset_ids],
+            player_info=body.get("playerInfo") or None,
+            prompts=prompts,
+        )
+        st, resp, hdr = character.play_generate_request(gen_body)
+        if st != 200:
+            err_raw = b""
+            try:
+                err_raw = resp.read() if hasattr(resp, "read") else b""
+            except Exception:
+                pass
+            try:
+                err_obj = json.loads(err_raw.decode("utf-8", "replace"))
+            except Exception:
+                err_obj = {"error": err_raw.decode("utf-8", "replace")[:800]}
+            _json(handler, st if st >= 400 else 400, {"ok": False, "status": st, **(err_obj if isinstance(err_obj, dict) else {"error": err_obj})})
+            return
+
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        handler.send_header("Cache-Control", "no-cache, no-transform")
+        handler.send_header("Connection", "close")
+        handler.send_header("Access-Control-Allow-Origin", "*")
+        handler.end_headers()
+
+        # 透传上游 SSE；同时规范化方便前端
+        try:
+            if hasattr(resp, "fp") and hasattr(resp.fp, "read"):
+                # HTTPResponse: iter lines
+                buf = b""
+                while True:
+                    chunk = resp.read(1024)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        handler.wfile.write(line + b"\n")
+                        handler.wfile.flush()
+                if buf:
+                    handler.wfile.write(buf)
+                    handler.wfile.flush()
+            else:
+                data = resp.read() if hasattr(resp, "read") else b""
+                handler.wfile.write(data)
+                handler.wfile.flush()
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+    except Exception as e:
+        if not handler.wfile.closed:
+            try:
+                _json(handler, 500, {"ok": False, "error": str(e)})
+            except Exception:
+                pass
+
+
 def do_card_get(local_id: str) -> dict:
     try:
         card = character.load_local(local_id)
@@ -881,9 +1073,16 @@ def do_card_get(local_id: str) -> dict:
 
 def do_card_new(body: dict) -> dict:
     try:
-        name = str(body.get("name") or "未命名角色").strip() or "未命名角色"
-        brief = str(body.get("brief") or "").strip()
-        saved = character.create_local(name, brief=brief)
+        # 空白新建：必须带卡名；不沿用上一张卡的简述
+        blank = body.get("blank")
+        if blank is None:
+            blank = True
+        blank = bool(blank)
+        name = str(body.get("name") or "").strip()
+        if not name:
+            return {"ok": False, "error": "必须填写卡名才能新建"}
+        brief = "" if blank else str(body.get("brief") or "").strip()
+        saved = character.create_local(name, brief=brief, blank=blank)
         return {
             "ok": True,
             "localId": saved["localId"],
@@ -1076,6 +1275,17 @@ def do_card_voice(body: dict) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+def do_card_export_png(local_id: str) -> dict:
+    try:
+        local_id = str(local_id or "").strip()
+        if not local_id:
+            return {"ok": False, "error": "需要 localId"}
+        result = character.export_card_png(local_id, save_copy=True)
+        return {"ok": True, **{k: v for k, v in result.items() if k != "bytes"}, "bytes": result["bytes"]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def do_card_delete_local(body: dict) -> dict:
     try:
         local_id = str(body.get("localId") or "").strip()
@@ -1198,9 +1408,10 @@ def _serve_card_asset(handler: BaseHTTPRequestHandler, local_id: str, rel: str) 
     handler.wfile.write(raw)
 
 
-def do_card_cloud_list() -> dict:
+def do_card_cloud_list(quick: bool = False) -> dict:
     try:
-        return {"ok": True, "items": character.list_cloud_cards()}
+        items = character.list_cloud_cards(enrich_listing=not quick)
+        return {"ok": True, "items": items, "quick": bool(quick)}
     except Exception as e:
         return {"ok": False, "error": str(e), "items": []}
 
@@ -1408,6 +1619,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/card/list":
             _json(self, 200, do_card_list())
             return
+        if path == "/api/card/chat-prompt":
+            qs = urllib.parse.parse_qs(parsed.query or "")
+            name = (qs.get("name") or [""])[0]
+            brief = (qs.get("brief") or [""])[0]
+            result = do_card_chat_prompt(name=name, brief=brief)
+            _json(self, 200 if result.get("ok") else 404, result)
+            return
         if path == "/api/card/get":
             qs = urllib.parse.parse_qs(parsed.query or "")
             local_id = (qs.get("id") or [""])[0]
@@ -1415,7 +1633,10 @@ class Handler(BaseHTTPRequestHandler):
             _json(self, 200 if result.get("ok") else 404, result)
             return
         if path == "/api/card/cloud":
-            result = do_card_cloud_list()
+            qs = urllib.parse.parse_qs(parsed.query or "")
+            quick_raw = (qs.get("quick") or ["0"])[0]
+            quick = str(quick_raw).lower() in ("1", "true", "yes")
+            result = do_card_cloud_list(quick=quick)
             _json(self, 200 if result.get("ok") else 400, result)
             return
         if path == "/api/card/poll":
@@ -1434,8 +1655,59 @@ class Handler(BaseHTTPRequestHandler):
             rel = (qs.get("path") or [""])[0]
             _serve_card_asset(self, local_id, rel)
             return
+        if path == "/api/card/export-png":
+            qs = urllib.parse.parse_qs(parsed.query or "")
+            local_id = (qs.get("id") or [""])[0]
+            result = do_card_export_png(local_id)
+            if not result.get("ok"):
+                _json(self, 400, {k: v for k, v in result.items() if k != "bytes"})
+                return
+            raw = result["bytes"]
+            filename = str(result.get("filename") or "card.png")
+            # RFC 5987 文件名
+            star = urllib.parse.quote(filename)
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header(
+                "Content-Disposition",
+                f"attachment; filename=\"card.png\"; filename*=UTF-8''{star}",
+            )
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         if path == "/api/card/voices":
             result = do_card_voices()
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/card/play/meta":
+            qs = urllib.parse.parse_qs(parsed.query or "")
+            try:
+                card_id = int((qs.get("cardId") or ["0"])[0] or 0)
+            except Exception:
+                card_id = 0
+            result = do_card_play_meta(card_id)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/card/play/models":
+            result = do_card_play_models()
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/card/play/presets":
+            result = do_card_play_presets()
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/card/play/messages":
+            qs = urllib.parse.parse_qs(parsed.query or "")
+            chat_id = (qs.get("chatId") or [""])[0]
+            result = do_card_play_messages(chat_id)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/card/play/settings":
+            qs = urllib.parse.parse_qs(parsed.query or "")
+            chat_id = (qs.get("chatId") or [""])[0]
+            result = do_card_play_settings_get(chat_id)
             _json(self, 200 if result.get("ok") else 400, result)
             return
         self._serve_static(path)
@@ -1525,6 +1797,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/card/cloud/delete":
             result = do_card_delete_cloud(body)
             _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/card/play/start":
+            result = do_card_play_start(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/card/play/settings":
+            result = do_card_play_settings_update(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/card/play/send":
+            _proxy_card_play_generate(self, body)
             return
         _json(self, 404, {"ok": False, "error": "not found"})
 

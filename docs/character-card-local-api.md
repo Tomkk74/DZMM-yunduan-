@@ -63,6 +63,76 @@ POST /api/trpc/<procedure>?batch=1   body: {"0":{"json":{...}}}
 2. 控制台侧栏「角色卡 → 本地写卡」：AI 写卡并保存、编辑、刷新列表、拉取云端到本地
 3. API：`/api/card/list|get|new|save|ai|cloud|pull`
 4. 云端写入已接：`POST /api/card/publish` → 本地图 + `uploadOrUpdate` / `saveDraft`；上架/下架请官网（控制台不提供按钮）；列表绿标读角色页 `isPublic`/`publishStatus`；游戏卡 pull 会被拒绝
+5. **试玩（平台对话）**：见下节
+
+## 试玩（平台对话）
+
+仅 **云端正式卡**（`data.db_id` / `_meta.cloudId` > 0，非草稿）可试玩。控制台点「试玩」后写卡区切为试玩面板。
+
+### 平台接口（摸底 2026-08）
+
+| 能力 | 调用 |
+| --- | --- |
+| 建会话 | tRPC `chat.createByCard` `{ cardId, fixedRandomIndex?, entryPoint }` → `{ chatId }`；`entryPoint` 须为平台枚举（本地用 `quick_chat`） |
+| 卡摘要 | tRPC `card.getForChat` / `card.getQuickChatPreview` |
+| 模型列表 | tRPC `chat.models` `{ service: "chat" }` → `categories[].modelGroups[].contexts[]`（`internalName`） |
+| 账号预设 | tRPC `preset.list` → `{ presets, settings.activePresetIds, settings.playerInfo }` |
+| 历史消息 | tRPC `chat.getMessages` `{ chatId }` |
+| 发消息 | `POST https://www.dzmm.ai/api/chat` JSON body（见下）→ **SSE** |
+| 断线续传 | `GET /api/chat/{chatId}/stream/{generationId}` |
+
+生成 body 要点：
+
+```json
+{
+  "operation": "generate",
+  "chatId": "...",
+  "cardId": 123,
+  "chatSettings": {
+    "model": "x-apex-surge-0505-16k",
+    "maxTokens": 2500,
+    "deepThinking": false,
+    "enableMemoryEnhance": false
+  },
+  "presetConfig": { "presetIds": ["…"], "playerInfo": "" },
+  "prompts": [{ "role": "user|assistant", "content": "…" }],
+  "content": "本轮用户输入"
+}
+```
+
+SSE 行格式：`data: {"type":"init|token|step|complete|error","data":…}`  
+- `token`：`data` 为增量字符串  
+- `complete`：整轮结束载荷  
+
+官网「上下文长度」16K/32K **不是** `maxTokens`，而是同一 `seriesKey` 下 `contexts[]` 的不同 `internalName`（如 `…-16k` vs 默认 32K，`maxContext` 字段）。  
+`maxTokens` 随深度思考：开 3500 / 关 2500。另有 `enableMemoryEnhance`。预设以 `presetConfig.presetIds` 覆盖本轮。
+
+### 本地代理
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/card/play/meta?cardId=` | 摘要 + 开场预览 |
+| POST | `/api/card/play/start` | `{ cardId, chatHistoryIndex? }` → `chatId` + 首轮消息 |
+| GET | `/api/card/play/models` | 聊天模型 |
+| GET | `/api/card/play/presets` | 账号预设 + `displayName`（`user.getMe.fullName`，开场 `{{user}}` 用） |
+| GET | `/api/card/play/messages?chatId=` | 拉历史 |
+| GET | `/api/card/play/settings?chatId=` | tRPC `chat.getSettings` |
+| POST | `/api/card/play/settings` | `{ chatId, settings }` → tRPC `chat.updateSettings`（title/style/maxTokens/model/imageGenerationModel/deepThinking/enableMemoryEnhance…） |
+| POST | `/api/card/play/send` | 透传平台 SSE（body 含 model / maxTokens / style / deepThinking / enableMemoryEnhance / imageGenerationModel / presetIds / prompts / content） |
+
+官网侧栏「设置」对应关系：
+
+| UI | 接口 |
+| --- | --- |
+| 开启高亮 / 经典样式 | 本地显示偏好（非 tRPC；高亮键同官网 `chat_enable_highlight`） |
+| 会话标题 / 风格 / 最大回复 Token / 图像模型 | `chat.updateSettings` |
+| 风格枚举 | `standard` \| `creative` \| `divergent` \| `apex_dry` |
+| 图像模型 | `anime` \| `iroha` |
+
+实现：`lib/dzmm_character.py`（`play_*`）+ `console.py`；UI：`web/index.html` `#cardPlayPanel`。  
+试玩消耗平台积分 / 受会员与模型权限约束；失败原样回传。
+
+探针脚本：`tools/probe_chat_play.py`（产物 `.probe-character-api/chat_play_probe.json` 等）。
 
 ## 探测产物目录
 

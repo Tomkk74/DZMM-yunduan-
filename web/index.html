@@ -26,15 +26,15 @@
       </nav>
 
       <nav class="menu" id="gameMenu" aria-label="游戏卡菜单">
-        <button type="button" class="menu-item active" data-panel="bridge">云端桥接</button>
-        <button type="button" class="menu-item" data-panel="login">账号登录</button>
+        <button type="button" class="menu-item" data-panel="bridge">云端桥接</button>
+        <button type="button" class="menu-item active" data-panel="login">账号登录</button>
         <button type="button" class="menu-item" data-panel="project">项目配置</button>
         <button type="button" class="menu-item" data-panel="pull">拉取容器</button>
         <button type="button" class="menu-item" data-panel="status">运行状态</button>
       </nav>
 
       <div class="sidebar-scroll">
-        <section class="panel active" id="panel-bridge" data-panel="bridge">
+        <section class="panel" id="panel-bridge" data-panel="bridge" hidden>
           <h2>云端桥接</h2>
           <div id="bridgeCard" class="bridge-card off">
             <p class="bridge-head"><span id="bridgeLamp" class="dot"></span><span id="bridgeHeadText">预览未启动</span></p>
@@ -57,7 +57,7 @@
           </div>
         </section>
 
-        <section class="panel" id="panel-login" data-panel="login" hidden>
+        <section class="panel active" id="panel-login" data-panel="login">
           <h2>账号登录</h2>
           <form id="loginForm" class="form" autocomplete="on">
             <label>
@@ -138,7 +138,7 @@
           </label>
           <div class="actions">
             <button type="button" class="btn accent" id="cardAiBtn">创建卡夹并监听</button>
-            <button type="button" class="btn" id="cardNewBtn">新建空白</button>
+            <button type="button" class="btn" id="cardCopyPromptBtn" title="复制开聊提示词（按当前卡名/简述动态生成，明确让 AI 写这张卡）">复制开聊提示词</button>
           </div>
           <div class="actions" style="margin-top:8px">
             <button type="button" class="btn" id="cardRefreshBtn">刷新列表</button>
@@ -147,12 +147,19 @@
           <p id="cardMsg" class="hint" style="margin-top:8px" hidden></p>
           <ul id="cardList" class="card-list"></ul>
           <div id="cloudCardBox" class="cloud-card-box" hidden>
+            <label class="cloud-search-label">
+              <span>检索</span>
+              <input id="cardCloudSearch" type="search" placeholder="按名字或 ID 检索…" autocomplete="off">
+            </label>
             <div class="actions" style="margin-bottom:8px">
               <button type="button" class="btn" id="cardCloudFilterAll">全部</button>
               <button type="button" class="btn" id="cardCloudFilterDraft">仅草稿</button>
               <button type="button" class="btn" id="cardCloudFilterPub">仅已保存</button>
             </div>
-            <ul id="cloudCardList" class="card-list"></ul>
+            <p id="cloudCardMore" class="hint cloud-card-more"></p>
+            <div id="cloudCardListScroll" class="cloud-card-scroll">
+              <ul id="cloudCardList" class="card-list"></ul>
+            </div>
           </div>
         </section>
       </div>
@@ -189,21 +196,25 @@
       <div id="cardStage" class="stage-mode card-stage" hidden>
         <header class="stage-bar">
           <div class="stage-title">
-            <strong>角色卡编辑</strong>
+            <strong id="cardStageTitle">角色卡编辑</strong>
             <span id="cardStageMeta" class="stage-meta">未打开卡</span>
           </div>
           <div class="actions stage-actions">
             <button type="button" class="btn" id="cardMenuBtn" title="展开左侧菜单">菜单</button>
             <button type="button" class="btn" id="cardNewBtn2">新建</button>
             <button type="button" class="btn accent" id="cardAiBtn2">创建卡夹</button>
+            <button type="button" class="btn" id="cardCopyPromptBtn2" title="复制当前卡的开聊提示词（已填入卡名）">复制开聊提示词</button>
             <button type="button" class="btn accent" id="cardSaveBtn">保存到卡夹</button>
+            <button type="button" class="btn" id="cardExportPngBtn" title="打包 SillyTavern PNG 卡，封面用第一张图">导出 PNG 卡</button>
             <button type="button" class="btn accent" id="cardPublishBtn" title="保存为云端正式卡（已保存）">保存到云端</button>
             <button type="button" class="btn" id="cardDraftBtn" title="仅云端草稿">云端草稿</button>
+            <button type="button" class="btn accent" id="cardPlayBtn" title="需已保存到云端的正式卡" disabled>试玩</button>
+            <button type="button" class="btn" id="cardPlayBackBtn" title="返回写卡" hidden>返回写卡</button>
             <button type="button" class="btn danger" id="cardDeleteLocalBtn" title="删除当前本地卡夹">删本地卡</button>
             <button type="button" class="btn" id="cardReloadBtn">重载当前</button>
           </div>
         </header>
-        <div class="card-editor">
+        <div class="card-editor" id="cardEditorWrap">
           <form id="cardForm" class="card-form">
             <nav class="card-tabs" aria-label="写卡分类">
               <button type="button" class="card-tab active" data-card-tab="basic">基础</button>
@@ -219,12 +230,12 @@
               </label>
               <div class="card-fields-grid">
                 <label>
-                  <span>名称 name</span>
-                  <input id="cardName" type="text" maxlength="80" placeholder="角色名">
+                  <span>角色名 name</span>
+                  <input id="cardName" type="text" maxlength="80" placeholder="例：星月凌霄">
                 </label>
                 <label>
                   <span>标签 tags</span>
-                  <input id="cardTags" type="text" placeholder="逗号分隔">
+                  <input id="cardTags" type="text" placeholder="输入后用逗号/空格分隔">
                 </label>
                 <label>
                   <span>创作者 creator</span>
@@ -235,24 +246,24 @@
                   <input id="cardVersion" type="text" placeholder="可选">
                 </label>
                 <label class="span-2">
-                  <span>简介 description</span>
-                  <textarea id="cardDescription" rows="4" placeholder="外貌、身份、背景…"></textarea>
+                  <span>详细描述 description</span>
+                  <textarea id="cardDescription" rows="4" placeholder="背景故事、重要经历、能力特长、关系网络…（可按 性别/年龄/性格/外貌/性癖 结构写）"></textarea>
                 </label>
                 <label>
                   <span>性格 personality</span>
-                  <textarea id="cardPersonality" rows="4" placeholder="性格、说话方式…"></textarea>
+                  <textarea id="cardPersonality" rows="4" placeholder="基本特质、情感表现、人际、价值观、行为模式、优缺点…"></textarea>
                 </label>
                 <label>
                   <span>场景 scenario</span>
-                  <textarea id="cardScenario" rows="4" placeholder="开场处境…"></textarea>
+                  <textarea id="cardScenario" rows="4" placeholder="物理环境、氛围、时间、相关人物、角色位置与情感联系…"></textarea>
                 </label>
                 <label class="span-2">
                   <span>系统指令 system_prompt</span>
-                  <textarea id="cardSystemPrompt" rows="4" placeholder="行为规则、立场、知识范围…"></textarea>
+                  <textarea id="cardSystemPrompt" rows="4" placeholder="语言风格、知识范围、行为模式、情感表达、互动规则、能力/立场…（写可执行规则）"></textarea>
                 </label>
                 <label class="span-2">
-                  <span>创作者备注 creator_notes</span>
-                  <textarea id="cardNotes" rows="3" placeholder="给人看的说明"></textarea>
+                  <span>角色卡介绍 creator_notes（AI 不可见）</span>
+                  <textarea id="cardNotes" rows="3" placeholder="给用户的概述、互动指南、玩法建议、版本说明…"></textarea>
                 </label>
               </div>
             </section>
@@ -262,7 +273,7 @@
                 <span>世界书名称 character_book.name</span>
                 <input id="cardBookName" type="text" placeholder="世界设定">
               </label>
-              <p class="hint">对应平台「世界书」步骤。也可直接改文件夹 <code>character_book/entries/001/</code>。</p>
+              <p class="hint">平台：常驻=每轮注入；非常驻靠触发词注入正文。也可改 <code>character_book/entries/001/</code>。写法见写作规范。</p>
               <div class="actions" style="margin:8px 0">
                 <button type="button" class="btn accent" id="cardWbAddBtn">新增条目</button>
               </div>
@@ -342,6 +353,118 @@
               <pre id="cardPreviewBody" class="card-preview-body"></pre>
             </div>
           </form>
+
+          <section id="cardPlayPanel" class="card-play-panel" hidden>
+            <div class="play-toolbar">
+              <label class="play-field play-field-inline">
+                <span>模型</span>
+                <select id="playModelSelect"><option value="">加载中…</option></select>
+              </label>
+              <div class="play-field play-field-inline play-context-field">
+                <span>上下文</span>
+                <div id="playContextLength" class="play-context-pills" role="group" aria-label="上下文长度"></div>
+              </div>
+              <label class="play-field play-check">
+                <input type="checkbox" id="playDeepThinking">
+                <span>深度思考</span>
+              </label>
+              <label class="play-field play-check">
+                <input type="checkbox" id="playMemoryEnhance">
+                <span>记忆增强</span>
+              </label>
+              <button type="button" class="btn" id="playPresetBtn" title="选择账号预设">预设</button>
+              <button type="button" class="btn" id="playSettingsBtn" title="会话设置">设置</button>
+              <button type="button" class="btn" id="playRefreshMetaBtn" title="刷新模型与预设">刷新</button>
+              <span id="playUserLabel" class="play-user-label" title="开场 {{user}} = 登录用户名">{{user}} · —</span>
+              <span id="playStatus" class="play-status">未开始</span>
+            </div>
+            <div id="playSuggest" class="play-suggest" hidden></div>
+            <div id="playMessages" class="play-messages" aria-live="polite"></div>
+            <div class="play-compose">
+              <textarea id="playInput" rows="1" placeholder="输入消息，Enter 发送 · Shift+Enter 换行"></textarea>
+              <button type="button" class="btn accent" id="playSendBtn">发送</button>
+            </div>
+            <div id="playPresetModal" class="play-preset-modal" hidden>
+              <div class="play-preset-dialog" role="dialog" aria-modal="true" aria-labelledby="playPresetTitle">
+                <header class="play-preset-head">
+                  <strong id="playPresetTitle">账号预设</strong>
+                  <button type="button" class="btn" id="playPresetCloseBtn">关闭</button>
+                </header>
+                <p class="hint play-preset-hint">多选后点「应用」；仅影响本轮试玩发送，不改账号全局激活项。</p>
+                <div id="playPresetList" class="play-preset-list"></div>
+                <footer class="play-preset-foot">
+                  <button type="button" class="btn" id="playPresetClearBtn">清空</button>
+                  <button type="button" class="btn accent" id="playPresetApplyBtn">应用</button>
+                </footer>
+              </div>
+            </div>
+            <div id="playSettingsModal" class="play-preset-modal" hidden>
+              <div class="play-preset-dialog play-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="playSettingsTitle">
+                <header class="play-preset-head">
+                  <strong id="playSettingsTitle">设置</strong>
+                  <button type="button" class="btn" id="playSettingsCloseBtn">关闭</button>
+                </header>
+                <div class="play-settings-body">
+                  <h4 class="play-settings-sec">基础设置</h4>
+                  <label class="play-settings-row">
+                    <span class="play-settings-label">
+                      <strong>开启高亮</strong>
+                      <small>高亮对话中的重点内容（本地显示）</small>
+                    </span>
+                    <input type="checkbox" id="playSetHighlight">
+                  </label>
+                  <label class="play-settings-row">
+                    <span class="play-settings-label">
+                      <strong>会话标题</strong>
+                      <small>自定义本会话标题</small>
+                    </span>
+                    <input type="text" id="playSetTitle" maxlength="80" placeholder="会话">
+                  </label>
+                  <label class="play-settings-row">
+                    <span class="play-settings-label">
+                      <strong>风格</strong>
+                      <small>调整 AI 回复的创意程度</small>
+                    </span>
+                    <select id="playSetStyle">
+                      <option value="standard">标准</option>
+                      <option value="creative">创意</option>
+                      <option value="divergent">发散</option>
+                      <option value="apex_dry">APEX 干爽</option>
+                    </select>
+                  </label>
+                  <label class="play-settings-row">
+                    <span class="play-settings-label">
+                      <strong>最大回复 Token</strong>
+                      <small>限制每次 AI 回复的最大长度</small>
+                    </span>
+                    <input type="number" id="playSetMaxTokens" min="0" max="8000" step="100" value="2500">
+                  </label>
+                  <label class="play-settings-row">
+                    <span class="play-settings-label">
+                      <strong>经典样式</strong>
+                      <small>大头像与蓝色气泡布局（本地显示）</small>
+                    </span>
+                    <input type="checkbox" id="playSetClassic">
+                  </label>
+                  <label class="play-settings-row">
+                    <span class="play-settings-label">
+                      <strong>图像模型</strong>
+                      <small>生图用；iroha 需 VIP2+</small>
+                    </span>
+                    <select id="playSetImageModel">
+                      <option value="anime">anime</option>
+                      <option value="iroha">iroha</option>
+                    </select>
+                  </label>
+                  <h4 class="play-settings-sec">预设设置</h4>
+                  <p class="hint">在工具栏点「预设」选择账号预设；无预设时请到官网预设中心创建。</p>
+                </div>
+                <footer class="play-preset-foot">
+                  <button type="button" class="btn accent" id="playSettingsApplyBtn">保存</button>
+                </footer>
+              </div>
+            </div>
+          </section>
         </div>
       </div>
     </main>
