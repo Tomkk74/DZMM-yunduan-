@@ -73,21 +73,82 @@
               <button type="button" class="btn" id="originProbeBtn">测速并优选</button>
             </div>
             <p id="originHint" class="hint" hidden></p>
-            <label>
-              <span>邮箱</span>
-              <input id="email" name="email" type="email" required placeholder="you@example.com">
-            </label>
-            <label>
-              <span>密码</span>
-              <input id="password" name="password" type="password" required placeholder="DZMM 账号密码">
-            </label>
-            <label class="check">
-              <input id="savePassword" type="checkbox" checked>
-              <span>保存密码到本机 .env</span>
-            </label>
-            <div class="actions">
-              <button type="submit" class="btn accent" id="loginBtn">登录</button>
-              <button type="button" class="btn" id="logoutBtn">退出</button>
+
+            <div class="login-tabs" id="loginTabs" role="tablist">
+              <button type="button" class="login-tab active" data-login-tab="password">邮箱密码</button>
+              <button type="button" class="login-tab" data-login-tab="code">登录码</button>
+              <button type="button" class="login-tab" data-login-tab="telegram">Telegram</button>
+              <button type="button" class="login-tab" data-login-tab="cookie">Cookie</button>
+            </div>
+
+            <div class="login-pane active" data-login-pane="password">
+              <p class="hint">与官网「邮箱 + 密码」相同。登不上可换线路，或改用其它方式。</p>
+              <label>
+                <span>邮箱</span>
+                <input id="email" name="email" type="email" placeholder="you@example.com">
+              </label>
+              <label>
+                <span>密码</span>
+                <input id="password" name="password" type="password" placeholder="DZMM 账号密码">
+              </label>
+              <label class="check">
+                <input id="savePassword" type="checkbox" checked>
+                <span>保存密码到本机 .env</span>
+              </label>
+              <div class="actions">
+                <button type="submit" class="btn accent" id="loginBtn">登录</button>
+                <button type="button" class="btn" id="logoutBtn">退出</button>
+              </div>
+            </div>
+
+            <div class="login-pane" data-login-pane="code" hidden>
+              <p class="hint">
+                对应官网「使用登录码登录」：在手机 App / 其它已登录设备打开登录码，截图或保存二维码图，上传到这里。
+              </p>
+              <label>
+                <span>登录码图片</span>
+                <input id="loginCodeFile" type="file" accept="image/*">
+              </label>
+              <div class="actions">
+                <button type="button" class="btn accent" id="loginCodeBtn">上传并登录</button>
+                <button type="button" class="btn" id="logoutBtn2">退出</button>
+              </div>
+            </div>
+
+            <div class="login-pane" data-login-pane="telegram" hidden>
+              <p class="hint">
+                对应官网 Telegram 登录：点「获取二维码」后，用 Telegram 扫码，或向 Bot 发送
+                <code>/login 码</code>。确认后本页会自动完成登录。
+              </p>
+              <div class="actions" style="margin-bottom:10px">
+                <button type="button" class="btn accent" id="tgStartBtn">获取二维码</button>
+                <button type="button" class="btn" id="tgStopBtn" disabled>停止等待</button>
+              </div>
+              <div id="tgBox" class="tg-box" hidden>
+                <a id="tgQrLink" href="#" target="_blank" rel="noopener" title="在 Telegram 打开">
+                  <img id="tgQrImg" alt="Telegram 登录二维码">
+                </a>
+                <p class="hint" id="tgMeta"></p>
+                <p class="hint" id="tgStatus">等待确认…</p>
+              </div>
+              <div class="actions">
+                <button type="button" class="btn" id="logoutBtn3">退出</button>
+              </div>
+            </div>
+
+            <div class="login-pane" data-login-pane="cookie" hidden>
+              <p class="hint">
+                适合邮箱登不上、或已在浏览器登录的情况：打开官网 → F12 → Application/存储 → Cookies，
+                复制 <code>sb-rls-auth-token</code>（或整段 Cookie）粘贴下方。
+              </p>
+              <label>
+                <span>Cookie</span>
+                <textarea id="cookieInput" rows="5" placeholder="sb-rls-auth-token=base64-...&#10;或 Cookie: sb-rls-auth-token=...; ..."></textarea>
+              </label>
+              <div class="actions">
+                <button type="button" class="btn accent" id="cookieLoginBtn">用 Cookie 登录</button>
+                <button type="button" class="btn" id="logoutBtn4">退出</button>
+              </div>
             </div>
           </form>
         </section>

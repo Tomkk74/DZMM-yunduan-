@@ -56,7 +56,14 @@ python start.py
 浏览器打开：`http://127.0.0.1:8788/`  
 可选参数：`--no-open` 不弹窗、`--no-preview` 只开控制台、`--no-kill` 不清理占用端口的旧进程。
 
-凭据写在本机 `.env`，**不会**上传到本仓库。也可在网页「账号登录」里勾选「保存密码到本机」。
+凭据写在本机 `.env`，**不会**上传到本仓库。网页「账号登录」支持与官网对齐的多种方式（任选其一即可）：
+
+| 方式 | 说明 |
+|:---|:---|
+| **邮箱密码** | 与官网相同；可勾选保存密码到本机 `.env` |
+| **登录码** | 在已登录的手机 App / 其它设备打开登录码，截图或保存二维码图后上传 |
+| **Telegram** | 获取二维码后用 Telegram 扫码，或向 Bot 发送 `/login 码`，本页自动轮询完成登录 |
+| **Cookie** | 浏览器已登录官网时，从 DevTools Cookies 复制 `sb-rls-auth-token`（或整段 Cookie）粘贴 |
 
 国内访问 `www.dzmm.ai` 易被拦时：在「账号登录」选国内线路，或点「测速并优选」（对齐官方 [线路页](https://dzmm-home.github.io/dzmm-addr/)）。换线路后需重新登录。
 
@@ -136,11 +143,11 @@ Agent 入口：[`AGENTS.md`](AGENTS.md) → [`_模板/AGENTS.md`](_模板/AGENTS
 | 步骤 | 说明 |
 |:---|:---|
 | 一键启动 | `start.bat` / `python start.py`（唯一启动方式） |
-| 账号登录 | 邮箱密码；可写本机 `.env` |
+| 账号登录 | 邮箱密码 / 登录码 / Telegram / Cookie；可写本机 `.env` |
 | 项目配置 | `character_id`（Workbench 地址栏）、本地项目路径（含 `publish/`）、预览端口（默认 `8791`） |
 | 拉取容器 | 云端整包落地；路径空则默认 `../{character_id}` |
 | 预览 | 启动时若已登录且本地有 `publish/` 会自动拉起；也可在网页里启停；全屏后用悬浮球：菜单 / 刷新 / **增量 sync** / **发布** |
-| 同步 | 对照 `_sync_meta.json` 增量上传；**更换 `character_id` 会自动全量**；强制全量加 `--full` |
+| 同步 | 对照 `_sync_meta.json` 增量上传；**换卡 / 无 pull 基线会自动全量**；失败文件会保留待重试；强制全量加 `--full` |
 
 ### 界面截图
 
@@ -172,10 +179,14 @@ Agent 入口：[`AGENTS.md`](AGENTS.md) → [`_模板/AGENTS.md`](_模板/AGENTS
 ```bat
 python start.py
 python lib\dzmm_studio.py login --email you@mail.com --password "***"
+python lib\dzmm_studio.py login --cookie "sb-rls-auth-token=..."
+python lib\dzmm_studio.py login --code-image sign-in.png
 python lib\dzmm_studio.py status --character-id <CHARACTER_ID>
 python lib\pull_container.py --character-id <CHARACTER_ID>
 python lib\dzmm_studio.py sync --character-id <CHARACTER_ID> --message "sync"
 ```
+
+Telegram 登录请用网页控制台「账号登录 → Telegram」（需扫码/轮询）。
 
 ---
 

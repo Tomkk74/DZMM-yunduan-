@@ -1037,6 +1037,52 @@ textarea.mono {
   font-weight: 600;
 }
 
+.login-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0 12px;
+}
+
+.login-tab {
+  border: 1px solid #bbb;
+  background: #f3f3f3;
+  color: var(--ink);
+  border-radius: 999px;
+  padding: 5px 10px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.login-tab.active {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: #fff;
+}
+
+.login-pane[hidden] {
+  display: none !important;
+}
+
+.tg-box {
+  display: grid;
+  gap: 8px;
+  justify-items: center;
+  padding: 12px;
+  border: 1px dashed #bbb;
+  background: #fafafa;
+  margin-bottom: 10px;
+}
+
+.tg-box img {
+  width: 180px;
+  height: 180px;
+  object-fit: contain;
+  background: #fff;
+  border: 1px solid #ddd;
+}
+
 .hint {
   margin: 0 0 10px;
   color: var(--muted);

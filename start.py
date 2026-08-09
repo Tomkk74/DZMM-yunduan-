@@ -55,18 +55,21 @@ def _pids_listening(port: int) -> list[int]:
             )
         except Exception:
             return []
-        needle = f":{int(port)}"
+        want = int(port)
         for line in out.splitlines():
-            if "LISTENING" not in line.upper() or needle not in line:
+            if "LISTENING" not in line.upper():
                 continue
-            # 匹配本机绑定 …:port
+            # 匹配本机绑定 …:port（避免 ":88" 误杀 ":8788"）
             parts = line.split()
             if len(parts) < 5:
                 continue
             local = parts[1] if parts[0].upper().startswith("TCP") else parts[0]
-            if not (local.endswith(needle) or local.endswith(f"]{needle}")):
+            hostport = local.rsplit(":", 1)
+            if len(hostport) != 2:
                 continue
             try:
+                if int(hostport[1]) != want:
+                    continue
                 pid = int(parts[-1])
             except ValueError:
                 continue

@@ -48,6 +48,23 @@ TEMPLATE_DIR = KIT_ROOT / "_模板"
 CHAT_PROMPT_PATH = TEMPLATE_DIR / "开聊提示词.txt"
 
 
+def _require_auth(min_remain: int = 30):
+    """load_auth 失败会 SystemExit；统一转成 RuntimeError，供卡接口 Exception 捕获。"""
+    try:
+        return studio.load_auth(min_remain=min_remain)
+    except SystemExit as e:
+        raise RuntimeError(str(e) or "未登录或鉴权失败") from e
+
+
+def _int_field(value, default: int) -> int:
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def build_chat_prompt(name: str = "", brief: str = "") -> dict:
     """读取根目录 `_模板/开聊提示词.txt`，用当前卡名/简述填好占位，便于一键复制。"""
     if not CHAT_PROMPT_PATH.is_file():
@@ -296,17 +313,26 @@ def _load_world_book(d: Path) -> dict:
                 ename = _read_text(ed / "name.txt") or str(meta.get("name") or ed.name)
                 enabled = _parse_bool(_read_text(ed / "enabled.txt"), bool(meta.get("enabled", True)))
                 constant = _parse_bool(_read_text(ed / "constant.txt"), bool(meta.get("constant", False)))
-                try:
-                    insertion_order = int(_read_text(ed / "insertion_order.txt") or meta.get("insertion_order") or (i - 1))
-                except Exception:
+                order_txt = _read_text(ed / "insertion_order.txt").strip()
+                if order_txt != "":
+                    insertion_order = _int_field(order_txt, i - 1)
+                elif meta.get("insertion_order") is not None and meta.get("insertion_order") != "":
+                    insertion_order = _int_field(meta.get("insertion_order"), i - 1)
+                else:
                     insertion_order = i - 1
-                try:
-                    position = int(_read_text(ed / "position.txt") or meta.get("position") or 4)
-                except Exception:
+                pos_txt = _read_text(ed / "position.txt").strip()
+                if pos_txt != "":
+                    position = _int_field(pos_txt, 4)
+                elif meta.get("position") is not None and meta.get("position") != "":
+                    position = _int_field(meta.get("position"), 4)
+                else:
                     position = 4
-                try:
-                    priority = int(_read_text(ed / "priority.txt") or meta.get("priority") or 100)
-                except Exception:
+                pri_txt = _read_text(ed / "priority.txt").strip()
+                if pri_txt != "":
+                    priority = _int_field(pri_txt, 100)
+                elif meta.get("priority") is not None and meta.get("priority") != "":
+                    priority = _int_field(meta.get("priority"), 100)
+                else:
                     priority = 100
                 comment = _read_text(ed / "comment.txt") or str((meta.get("extensions") or {}).get("comment") or "")
                 extensions = meta.get("extensions") if isinstance(meta.get("extensions"), dict) else {}
@@ -365,24 +391,28 @@ def _write_world_book(d: Path, book: dict) -> None:
         _write_text(folder / "content.txt", str(ent.get("content") or ""))
         _write_text(folder / "enabled.txt", _bool_text(bool(ent.get("enabled", True))))
         _write_text(folder / "constant.txt", _bool_text(bool(ent.get("constant", False))))
-        _write_text(folder / "insertion_order.txt", str(int(ent.get("insertion_order") or (i - 1))))
-        _write_text(folder / "position.txt", str(int(ent.get("position") if ent.get("position") is not None else 4)))
-        _write_text(folder / "priority.txt", str(int(ent.get("priority") or 100)))
+        insertion_order = _int_field(ent.get("insertion_order"), i - 1)
+        position = _int_field(ent.get("position"), 4)
+        priority = _int_field(ent.get("priority"), 100)
+        eid = _int_field(ent.get("id"), i)
+        _write_text(folder / "insertion_order.txt", str(insertion_order))
+        _write_text(folder / "position.txt", str(position))
+        _write_text(folder / "priority.txt", str(priority))
         ext = ent.get("extensions") if isinstance(ent.get("extensions"), dict) else {}
         comment = str(ext.get("comment") or "")
         _write_text(folder / "comment.txt", comment)
         _write_json(
             folder / "entry.json",
             {
-                "id": int(ent.get("id") or i),
+                "id": eid,
                 "name": str(ent.get("name") or f"条目{i}"),
                 "keys": keys,
                 "content": str(ent.get("content") or ""),
                 "enabled": bool(ent.get("enabled", True)),
                 "constant": bool(ent.get("constant", False)),
-                "insertion_order": int(ent.get("insertion_order") or (i - 1)),
-                "position": int(ent.get("position") if ent.get("position") is not None else 4),
-                "priority": int(ent.get("priority") or 100),
+                "insertion_order": insertion_order,
+                "position": position,
+                "priority": priority,
                 "extensions": ext,
             },
         )
@@ -711,8 +741,19 @@ def load_local(local_id: str) -> dict:
     return load_from_folder(local_id)
 
 
-def save_local(card: dict, local_id: str | None = None) -> dict:
-    return write_folder(card, local_id=local_id)
+def save_local(
+    card: dict,
+    local_id: str | None = None,
+    *,
+    previous_local_id: str | None = None,
+    force: bool = False,
+) -> dict:
+    """写入卡夹。换目录名时若目标已存在且非原卡，默认拒绝覆盖。"""
+    target = _safe_folder_name(local_id or "") if local_id else ""
+    prev = _safe_folder_name(previous_local_id or "") if previous_local_id else ""
+    if target and prev and target != prev and _card_dir(target).is_dir() and not force:
+        raise ValueError(f"卡夹「{target}」已存在，请换名或先删除后再保存")
+    return write_folder(card, local_id=local_id or None)
 
 
 def prepare_workspace(name: str, brief: str = "") -> dict:
@@ -997,7 +1038,7 @@ def poll_local(local_id: str, since_mtime: float = 0.0, since_sig: str = "") -> 
 
 
 def _trpc_get(path: str, payload: dict | None = None) -> dict:
-    cookie, token, _, _ = studio.load_auth(min_remain=30)
+    cookie, token, _, _ = _require_auth(30)
     payload = payload or {}
     q = urllib.parse.quote(json.dumps({"0": {"json": payload}}, separators=(",", ":")))
     url = f"{studio.get_origin()}/api/trpc/{path}?batch=1&input={q}"
@@ -1075,7 +1116,7 @@ def fetch_character_listing_status(card_id: int) -> dict:
     card_id = int(card_id)
     if card_id <= 0:
         raise ValueError("需要有效 cardId")
-    cookie, token, _, _ = studio.load_auth(min_remain=30)
+    cookie, token, _, _ = _require_auth(30)
     st, raw, _ = studio.http(
         f"{studio.get_origin()}/character/{card_id}",
         cookie,
@@ -1110,6 +1151,7 @@ def fetch_character_listing_status(card_id: int) -> dict:
         "firstPublishedAt": first_published,
         "isPendingReview": is_pending,
         "isListed": bool(is_listed and not is_hidden),
+        "listingStatusKnown": True,
     }
 
 
@@ -1141,6 +1183,7 @@ def _game_stats_public_map() -> dict[int, dict]:
             "firstPublishedAt": str(c.get("publishedAt") or ""),
             "isPendingReview": False,
             "isListed": bool(is_public and not is_hidden),
+            "listingStatusKnown": True,
         }
     return out
 
@@ -1149,23 +1192,51 @@ def _apply_listing_fields(item: dict, status: dict | None) -> dict:
     if not status:
         item["isListed"] = False
         item["isPendingReview"] = False
+        item["listingStatusKnown"] = False
         return item
+    known = status.get("listingStatusKnown")
+    if known is None:
+        known = status.get("isPublic") is not None or bool(status.get("publishStatus"))
+    item["listingStatusKnown"] = bool(known)
     item["isPublic"] = status.get("isPublic")
     item["isHidden"] = status.get("isHidden")
     item["publishStatus"] = status.get("publishStatus")
     item["firstPublishedAt"] = status.get("firstPublishedAt") or ""
-    item["isPendingReview"] = bool(status.get("isPendingReview"))
-    item["isListed"] = bool(status.get("isListed"))
+    item["isPendingReview"] = bool(status.get("isPendingReview")) if known else False
+    item["isListed"] = bool(status.get("isListed")) if known else False
     return item
 
 
+def _patch_local_card_meta(local_name: str, meta_updates: dict, *, db_id: int | None = None) -> None:
+    """只改 card.json 的 _meta（及可选 db_id），避免全量 write_folder 冲掉未保存 txt。"""
+    d = _card_dir(local_name)
+    jp = d / "card.json"
+    payload: dict = {"spec": "chara_card_v3", "spec_version": "3.0", "data": {}, "_meta": {}}
+    if jp.is_file():
+        try:
+            old = json.loads(jp.read_text(encoding="utf-8"))
+            if isinstance(old, dict):
+                payload.update({k: old[k] for k in ("spec", "spec_version") if k in old})
+                if isinstance(old.get("data"), dict):
+                    payload["data"] = dict(old["data"])
+                if isinstance(old.get("_meta"), dict):
+                    payload["_meta"] = dict(old["_meta"])
+        except Exception:
+            pass
+    meta = payload["_meta"] if isinstance(payload.get("_meta"), dict) else {}
+    meta.update({k: v for k, v in meta_updates.items() if v is not None})
+    payload["_meta"] = meta
+    if db_id is not None:
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        data["db_id"] = int(db_id)
+        payload["data"] = data
+    _write_json(jp, payload)
+
+
 def _sync_local_listing_meta(cloud_id: int, *, status: dict, name_hint: str = "") -> None:
-    """把云端上架状态写回本地卡夹 _meta（顺带补 cloudId）。"""
+    """把云端上架状态写回本地卡夹 _meta。只按 cloudId/db_id 匹配，禁止按同名绑定。"""
+    del name_hint  # 保留参数兼容旧调用；绝不用名字猜绑
     local_name = _find_local_id_by_cloud_id(cloud_id)
-    if not local_name and name_hint:
-        safe = _safe_folder_name(name_hint)
-        if _card_dir(safe).is_dir():
-            local_name = safe
     if not local_name:
         return
     try:
@@ -1174,41 +1245,34 @@ def _sync_local_listing_meta(cloud_id: int, *, status: dict, name_hint: str = ""
         return
     meta = card.get("_meta") if isinstance(card.get("_meta"), dict) else {}
     data = card.get("data") if isinstance(card.get("data"), dict) else {}
-    changed = False
+    meta_updates: dict = {}
+    db_patch: int | None = None
     if meta.get("cloudId") != cloud_id:
-        meta["cloudId"] = cloud_id
-        changed = True
+        meta_updates["cloudId"] = cloud_id
     try:
         db_id = int(data.get("db_id") or 0)
     except (TypeError, ValueError):
         db_id = 0
     if db_id != cloud_id:
-        data["db_id"] = cloud_id
-        card["data"] = data
-        changed = True
-    # 仅在读到明确 isPublic / publishStatus 时改上架标记，避免请求失败把本地绿标抹掉
+        db_patch = cloud_id
+    # 仅在读到明确 isPublic / publishStatus 时改上架标记
     definitive = status.get("isPublic") is not None or bool(status.get("publishStatus"))
     if definitive:
         listed = bool(status.get("isListed"))
         pending = bool(status.get("isPendingReview"))
         if bool(meta.get("isListed")) != listed:
-            meta["isListed"] = listed
-            changed = True
+            meta_updates["isListed"] = listed
         if listed and not meta.get("listedAt"):
-            meta["listedAt"] = status.get("firstPublishedAt") or _now_iso()
-            changed = True
+            meta_updates["listedAt"] = status.get("firstPublishedAt") or _now_iso()
         pub_status = status.get("publishStatus")
         if meta.get("publishStatus") != pub_status:
-            meta["publishStatus"] = pub_status
-            changed = True
+            meta_updates["publishStatus"] = pub_status
         if bool(meta.get("isPendingReview")) != pending:
-            meta["isPendingReview"] = pending
-            changed = True
-    if not changed:
+            meta_updates["isPendingReview"] = pending
+    if not meta_updates and db_patch is None:
         return
-    card["_meta"] = meta
     try:
-        write_folder(card, local_id=local_name)
+        _patch_local_card_meta(local_name, meta_updates, db_id=db_patch)
     except Exception:
         return
 
@@ -1275,6 +1339,7 @@ def list_cloud_cards(*, enrich_listing: bool = True) -> list[dict]:
                         "firstPublishedAt": "",
                         "isPendingReview": False,
                         "isListed": False,
+                        "listingStatusKnown": False,
                     }
 
     for it in out:
@@ -1285,6 +1350,8 @@ def list_cloud_cards(*, enrich_listing: bool = True) -> list[dict]:
             st = status_map.get(cid)
             if st:
                 _apply_listing_fields(it, st)
+            elif "listingStatusKnown" not in it:
+                it["listingStatusKnown"] = False
         _sync_local_listing_meta(
             cid,
             status={
@@ -1292,8 +1359,9 @@ def list_cloud_cards(*, enrich_listing: bool = True) -> list[dict]:
                 "isPendingReview": bool(it.get("isPendingReview")),
                 "publishStatus": it.get("publishStatus"),
                 "firstPublishedAt": it.get("firstPublishedAt") or "",
+                "isPublic": it.get("isPublic"),
+                "listingStatusKnown": bool(it.get("listingStatusKnown")),
             },
-            name_hint=str(it.get("name") or ""),
         )
     return out
 
@@ -1519,7 +1587,7 @@ def remove_cloud_card(
     *,
     cloud_id: int,
     is_draft: bool | None = None,
-    also_hide_published: bool = True,
+    also_hide_published: bool = False,
     cascade_drafts: bool = True,
     character_id: int | None = None,
 ) -> dict:
@@ -1656,6 +1724,26 @@ def pull_cloud_card(cloud_id: int, *, folder_name: str | None = None, is_draft: 
         or (f"草稿-{cloud_id}" if draft else f"云端-{cloud_id}")
     )
     name = _safe_folder_name(name_src)
+    # 同名夹若已绑定其他云端卡，改落到唯一目录，禁止静默覆盖
+    existing_dir = _card_dir(name)
+    if existing_dir.is_dir():
+        try:
+            existing = load_from_folder(name)
+            ex_meta = existing.get("_meta") if isinstance(existing.get("_meta"), dict) else {}
+            ex_cloud = int(ex_meta.get("cloudId") or 0)
+            ex_draft = int(ex_meta.get("draftId") or 0)
+            try:
+                ex_db = int((existing.get("data") or {}).get("db_id") or 0)
+            except (TypeError, ValueError):
+                ex_db = 0
+            same = (
+                (not draft and (ex_cloud == cloud_id or ex_db == cloud_id))
+                or (draft and ex_draft == cloud_id)
+            )
+            if not same and (ex_cloud or ex_draft or ex_db > 0 or _card_content_score(existing.get("data")) > 0):
+                name = _unique_local_id(name)
+        except Exception:
+            name = _unique_local_id(name)
     card["data"]["name"] = str(card["data"].get("name") or name)
     # 规范化世界书
     cb = card["data"].get("character_book")
@@ -1683,7 +1771,7 @@ def pull_cloud_card(cloud_id: int, *, folder_name: str | None = None, is_draft: 
 
 
 def _trpc_post(path: str, payload: dict) -> dict:
-    cookie, token, _, _ = studio.load_auth(min_remain=30)
+    cookie, token, _, _ = _require_auth(30)
     body = json.dumps({"0": {"json": payload}}, ensure_ascii=False).encode("utf-8")
     st, raw, _ = studio.http(
         f"{studio.get_origin()}/api/trpc/{path}?batch=1",
@@ -1714,7 +1802,7 @@ def upload_character_image(raw: bytes, filename: str = "image.png") -> str:
     """上传图片到平台，返回 image_url。"""
     if not raw:
         raise ValueError("空图片")
-    cookie, token, _, _ = studio.load_auth(min_remain=30)
+    cookie, token, _, _ = _require_auth(30)
     boundary = "----dzmm" + uuid.uuid4().hex
     fname = Path(filename or "image.png").name or "image.png"
     mime = "image/png"
@@ -1887,11 +1975,12 @@ def publish_to_cloud(local_id: str, *, as_draft: bool = False) -> dict:
         if meta.get("draftVersion") is not None:
             payload["baseVersion"] = meta.get("draftVersion")
         result = _trpc_post("studio.saveDraft", payload)
+        # 只更新 meta，保留本地 assets/ 路径，避免下次换图不再上传
         meta["draftId"] = result.get("id") or draft_id
         meta["draftVersion"] = result.get("version")
         meta["source"] = "cloud-draft"
-        card["_meta"] = meta
-        card["data"] = raw_data["data"]
+        card = load_from_folder(local_id)
+        card["_meta"] = {**(card.get("_meta") or {}), **meta}
         saved = write_folder(card, local_id=local_id)
         return {
             **saved,
@@ -1907,11 +1996,12 @@ def publish_to_cloud(local_id: str, *, as_draft: bool = False) -> dict:
     new_id = int(result.get("id") or db_id or 0)
     if new_id <= 0:
         raise RuntimeError(f"云端保存成功但未返回 id: {result}")
-    raw_data["data"]["db_id"] = new_id
-    card["data"] = raw_data["data"]
+    # 重新读盘：保留本地相对路径；只写入云端 id / meta
+    card = load_from_folder(local_id)
+    meta = card.get("_meta") if isinstance(card.get("_meta"), dict) else {}
+    card["data"]["db_id"] = new_id
     meta["cloudId"] = new_id
     meta["source"] = "cloud"
-    # 正式保存后清掉本地草稿指针（草稿本身不自动删，留给平台侧）
     meta.pop("draftId", None)
     meta.pop("draftVersion", None)
     card["_meta"] = meta
@@ -2034,7 +2124,7 @@ def _chat_http(
     stream: bool = False,
 ):
     """角色聊天用 HTTP；Referer 指向 /chat。stream=True 时返回 (status, response, headers)。"""
-    cookie, token, _, _ = studio.load_auth(min_remain=30)
+    cookie, token, _, _ = _require_auth(30)
     headers = {
         "Cookie": cookie,
         "Authorization": f"Bearer {token}",

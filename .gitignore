@@ -15,7 +15,10 @@ Thumbs.db
 .idea/
 .vscode/
 .cursor/
+.cursorrules
+*.code-workspace
 tools/_*
+tools/probe_*.py
 *.log
 .pull_cache/
 _tmp*

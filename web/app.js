@@ -47,6 +47,7 @@
     selectedModel: '',
     charName: '',
     userName: '',
+    playerInfo: '',
     presetCatalog: [],
     selectedPresetIds: [],
     // 会话设置（chat.getSettings / updateSettings）
@@ -89,7 +90,7 @@
   function setBusy(busy, opts) {
     opts = opts || {};
     var keep = opts.keepEnabled || {};
-    ['loginBtn', 'logoutBtn', 'pingBtn', 'pullBtn', 'pullRetryBtn', 'previewStartBtn', 'previewStopBtn', 'previewReloadBtn', 'publishBtn', 'bridgeRefreshBtn', 'fabPublish', 'fabReload', 'fabSync', 'fabExpand', 'originProbeBtn', 'originSelect', 'cardAiBtn', 'cardCopyPromptBtn', 'cardNewBtn2', 'cardSaveBtn', 'cardExportPngBtn', 'cardRefreshBtn', 'cardCloudBtn', 'cardReloadBtn', 'cardMenuBtn', 'cardVoiceRefreshBtn', 'cardVoiceClearBtn', 'cardPublishBtn', 'cardDraftBtn', 'cardCloudFilterAll', 'cardCloudFilterDraft', 'cardCloudFilterPub', 'cardCloudSearch'].forEach(function (id) {
+    ['loginBtn', 'logoutBtn', 'logoutBtn2', 'logoutBtn3', 'logoutBtn4', 'loginCodeBtn', 'cookieLoginBtn', 'tgStartBtn', 'tgStopBtn', 'pingBtn', 'pullBtn', 'pullRetryBtn', 'previewStartBtn', 'previewStopBtn', 'previewReloadBtn', 'publishBtn', 'bridgeRefreshBtn', 'fabPublish', 'fabReload', 'fabSync', 'fabExpand', 'originProbeBtn', 'originSelect', 'cardAiBtn', 'cardCopyPromptBtn', 'cardNewBtn2', 'cardSaveBtn', 'cardExportPngBtn', 'cardRefreshBtn', 'cardCloudBtn', 'cardReloadBtn', 'cardMenuBtn', 'cardVoiceRefreshBtn', 'cardVoiceClearBtn', 'cardPublishBtn', 'cardDraftBtn', 'cardCloudFilterAll', 'cardCloudFilterDraft', 'cardCloudFilterPub', 'cardCloudSearch'].forEach(function (id) {
       var el = $(id);
       if (!el) return;
       if (busy && keep[id]) {
@@ -711,6 +712,15 @@
       var wrap = document.createElement('div');
       wrap.className = 'wb-entry';
       wrap.dataset.idx = String(idx);
+      wrap.dataset.entryId = String(ent.id != null ? ent.id : (idx + 1));
+      wrap.dataset.position = String(ent.position != null ? ent.position : 4);
+      wrap.dataset.priority = String(ent.priority != null ? ent.priority : 100);
+      wrap.dataset.insertionOrder = String(ent.insertion_order != null ? ent.insertion_order : idx);
+      try {
+        wrap.dataset.extensions = JSON.stringify(ent.extensions && typeof ent.extensions === 'object' ? ent.extensions : {});
+      } catch (_) {
+        wrap.dataset.extensions = '{}';
+      }
       wrap.innerHTML =
         '<div class="wb-entry-head"><strong>条目 ' + (idx + 1) + '</strong>' +
         '<button type="button" class="btn wb-del" data-idx="' + idx + '">删除</button></div>' +
@@ -752,17 +762,29 @@
     var out = [];
     box.querySelectorAll('.wb-entry').forEach(function (wrap, idx) {
       var comment = (wrap.querySelector('.wb-comment').value || '').trim();
+      var ext = {};
+      try {
+        ext = JSON.parse(wrap.dataset.extensions || '{}') || {};
+      } catch (_) {
+        ext = {};
+      }
+      if (comment) ext.comment = comment;
+      else delete ext.comment;
+      var id = parseInt(wrap.dataset.entryId, 10);
+      var position = parseInt(wrap.dataset.position, 10);
+      var priority = parseInt(wrap.dataset.priority, 10);
+      var insertionOrder = parseInt(wrap.dataset.insertionOrder, 10);
       out.push({
-        id: idx + 1,
+        id: Number.isFinite(id) ? id : (idx + 1),
         name: wrap.querySelector('.wb-name').value.trim() || ('条目' + (idx + 1)),
         keys: textToTags(wrap.querySelector('.wb-keys').value),
         content: wrap.querySelector('.wb-content').value,
         enabled: !!wrap.querySelector('.wb-enabled').checked,
         constant: !!wrap.querySelector('.wb-constant').checked,
-        insertion_order: idx,
-        position: 4,
-        priority: 100,
-        extensions: comment ? { comment: comment } : {},
+        insertion_order: Number.isFinite(insertionOrder) ? insertionOrder : idx,
+        position: Number.isFinite(position) ? position : 4,
+        priority: Number.isFinite(priority) ? priority : 100,
+        extensions: ext,
       });
     });
     return out;
@@ -1452,7 +1474,9 @@
         actions.appendChild(pullBtn);
       }
 
-      if (it.isDraft || (!it.isDraft && !isListed && !isPending && !it.isGamefy)) {
+      // 上架状态未知时不展示「隐藏」，避免误下架
+      var listingKnown = it.isDraft || it.listingStatusKnown === true || it.isPublic != null || !!it.publishStatus || !!listedMap[cid];
+      if (it.isDraft || (!it.isDraft && listingKnown && !isListed && !isPending && !it.isGamefy)) {
         var delBtn = document.createElement('button');
         delBtn.type = 'button';
         delBtn.className = 'btn danger';
@@ -1619,10 +1643,25 @@
         return;
       }
       var folderName = ($('cardFolderName') && $('cardFolderName').value.trim()) || currentCardId || card.data.name;
+      var forceOverwrite = false;
+      if (currentCardId && folderName && folderName !== currentCardId) {
+        var exists = (window.__localCardListed || []).some(function (it) {
+          return it && it.localId === folderName;
+        });
+        if (exists) {
+          if (!window.confirm('卡夹「' + folderName + '」已存在，确定覆盖吗？')) {
+            showMsg('已取消保存', false);
+            return;
+          }
+          forceOverwrite = true;
+        }
+      }
       var data = await api('/api/card/save', {
         method: 'POST',
         body: JSON.stringify({
           localId: folderName,
+          previousLocalId: currentCardId || '',
+          force: forceOverwrite,
           brief: getCardBrief(),
           card: card,
         }),
@@ -1897,22 +1936,78 @@
     });
   }
 
+  function loginSidePayload() {
+    return {
+      characterId: $('characterId') ? $('characterId').value : undefined,
+      projectPath: $('projectPath') ? $('projectPath').value.trim() : undefined,
+      previewPort: $('previewPort') ? $('previewPort').value : undefined,
+      origin: $('originSelect') ? $('originSelect').value : undefined,
+    };
+  }
+
+  function switchLoginTab(tab) {
+    var tabs = document.querySelectorAll('#loginTabs .login-tab');
+    var panes = document.querySelectorAll('#loginForm .login-pane');
+    tabs.forEach(function (btn) {
+      btn.classList.toggle('active', btn.getAttribute('data-login-tab') === tab);
+    });
+    panes.forEach(function (pane) {
+      var on = pane.getAttribute('data-login-pane') === tab;
+      pane.classList.toggle('active', on);
+      pane.hidden = !on;
+    });
+    if (tab !== 'telegram') stopTelegramPoll();
+  }
+
+  var tgPollTimer = null;
+  var tgSignInCode = '';
+
+  function stopTelegramPoll() {
+    if (tgPollTimer) {
+      clearInterval(tgPollTimer);
+      tgPollTimer = null;
+    }
+    tgSignInCode = '';
+    if ($('tgStopBtn')) $('tgStopBtn').disabled = true;
+  }
+
+  async function runLogout() {
+    setBusy(true);
+    try {
+      stopTelegramPoll();
+      var data = await api('/api/logout', { method: 'POST', body: '{}' });
+      if (data.status) fillForm(data.status);
+      showMsg('已清除本地登录 cookie', true);
+    } catch (e) {
+      showMsg(String(e.message || e), false);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if ($('loginTabs')) {
+    $('loginTabs').addEventListener('click', function (ev) {
+      var btn = ev.target && ev.target.closest ? ev.target.closest('[data-login-tab]') : null;
+      if (!btn) return;
+      switchLoginTab(btn.getAttribute('data-login-tab'));
+    });
+  }
+
   $('loginForm').addEventListener('submit', async function (ev) {
     ev.preventDefault();
+    var active = document.querySelector('#loginForm .login-pane.active');
+    var pane = active ? active.getAttribute('data-login-pane') : 'password';
+    if (pane !== 'password') return;
     setBusy(true);
     showMsg('正在登录…', true);
     try {
+      var payload = loginSidePayload();
+      payload.email = $('email').value.trim();
+      payload.password = $('password').value;
+      payload.savePassword = $('savePassword').checked;
       var data = await api('/api/login', {
         method: 'POST',
-        body: JSON.stringify({
-          email: $('email').value.trim(),
-          password: $('password').value,
-          savePassword: $('savePassword').checked,
-          characterId: $('characterId').value,
-          projectPath: $('projectPath').value.trim(),
-          previewPort: $('previewPort').value,
-          origin: $('originSelect') ? $('originSelect').value : undefined,
-        }),
+        body: JSON.stringify(payload),
       });
       if (data.status) fillForm(data.status);
       if (data.ok) {
@@ -1927,6 +2022,158 @@
       setBusy(false);
     }
   });
+
+  if ($('loginCodeBtn')) {
+    $('loginCodeBtn').addEventListener('click', async function () {
+      var input = $('loginCodeFile');
+      var file = input && input.files && input.files[0];
+      if (!file) {
+        showMsg('请先选择登录码图片', false);
+        return;
+      }
+      setBusy(true);
+      showMsg('正在识别登录码…', true);
+      try {
+        var dataUrl = await new Promise(function (resolve, reject) {
+          var reader = new FileReader();
+          reader.onload = function () { resolve(String(reader.result || '')); };
+          reader.onerror = function () { reject(new Error('读取图片失败')); };
+          reader.readAsDataURL(file);
+        });
+        var payload = loginSidePayload();
+        payload.imageBase64 = dataUrl;
+        payload.filename = file.name || 'sign-in-code.jpg';
+        var data = await api('/api/login/code', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+        if (data.status) fillForm(data.status);
+        if (data.ok) {
+          showMsg('登录码登录成功 · 剩余约 ' + data.remainSec + 's', true);
+          if (input) input.value = '';
+        } else {
+          showMsg(data.error || '登录码登录失败', false);
+        }
+      } catch (e) {
+        showMsg(String(e.message || e), false);
+      } finally {
+        setBusy(false);
+      }
+    });
+  }
+
+  if ($('cookieLoginBtn')) {
+    $('cookieLoginBtn').addEventListener('click', async function () {
+      var cookie = ($('cookieInput') && $('cookieInput').value.trim()) || '';
+      if (!cookie) {
+        showMsg('请粘贴 Cookie', false);
+        return;
+      }
+      setBusy(true);
+      showMsg('正在校验 Cookie…', true);
+      try {
+        var payload = loginSidePayload();
+        payload.cookie = cookie;
+        var data = await api('/api/login/cookie', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+        if (data.status) fillForm(data.status);
+        if (data.ok) {
+          showMsg('Cookie 登录成功 · 剩余约 ' + data.remainSec + 's', true);
+          if ($('cookieInput')) $('cookieInput').value = '';
+        } else {
+          showMsg(data.error || 'Cookie 登录失败', false);
+        }
+      } catch (e) {
+        showMsg(String(e.message || e), false);
+      } finally {
+        setBusy(false);
+      }
+    });
+  }
+
+  if ($('tgStartBtn')) {
+    $('tgStartBtn').addEventListener('click', async function () {
+      setBusy(true);
+      showMsg('正在获取 Telegram 登录码…', true);
+      stopTelegramPoll();
+      try {
+        var data = await api('/api/login/telegram/start', {
+          method: 'POST',
+          body: JSON.stringify(loginSidePayload()),
+        });
+        if (!data.ok) {
+          showMsg(data.error || '获取失败', false);
+          return;
+        }
+        tgSignInCode = data.signInCode || '';
+        if ($('tgBox')) $('tgBox').hidden = false;
+        if ($('tgQrImg')) {
+          var svg = String(data.qrCodeSvg || '');
+          if (svg.indexOf('data:') === 0) {
+            $('tgQrImg').src = svg;
+          } else if (svg.indexOf('<svg') >= 0) {
+            $('tgQrImg').src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+          } else if (data.qrCodeUrl) {
+            // 无可用 SVG 时用 t.me 链接作提示（二维码图可能缺失）
+            $('tgQrImg').removeAttribute('src');
+            $('tgQrImg').alt = '请点上方链接打开 Telegram，或向 Bot 发送 /login ' + (data.signInCode || '');
+          } else {
+            $('tgQrImg').src = '';
+          }
+        }
+        if ($('tgQrLink')) $('tgQrLink').href = data.qrCodeUrl || '#';
+        if ($('tgMeta')) {
+          $('tgMeta').textContent =
+            'Bot @' + (data.botUsername || '') +
+            ' · 指令 /login ' + (data.signInCode || '') +
+            (data.createdAt ? ' · 创建于 ' + data.createdAt : '');
+        }
+        if ($('tgStatus')) $('tgStatus').textContent = '等待 Telegram 确认…';
+        if ($('tgStopBtn')) $('tgStopBtn').disabled = false;
+        showMsg('请用 Telegram 扫码或发送 /login ' + tgSignInCode, true);
+        tgPollTimer = setInterval(async function () {
+          if (!tgSignInCode) return;
+          try {
+            var poll = await api('/api/login/telegram/poll', {
+              method: 'POST',
+              body: JSON.stringify({ signInCode: tgSignInCode }),
+            });
+            if (poll.status) fillForm(poll.status);
+            if (poll.ok && poll.loggedIn) {
+              stopTelegramPoll();
+              showMsg('Telegram 登录成功 · 剩余约 ' + poll.remainSec + 's', true);
+              if ($('tgStatus')) $('tgStatus').textContent = '已登录';
+              return;
+            }
+            if ($('tgStatus')) {
+              $('tgStatus').textContent =
+                (poll.tgStatus || 'waiting') + (poll.message ? ' · ' + poll.message : '');
+            }
+            if (poll.tgStatus === 'code_expired' || poll.tgStatus === 'user_rejected' || poll.tgStatus === 'login_failed') {
+              stopTelegramPoll();
+              showMsg(poll.message || ('Telegram 登录结束：' + poll.tgStatus), false);
+            }
+          } catch (e) {
+            if ($('tgStatus')) $('tgStatus').textContent = String(e.message || e);
+          }
+        }, 1500);
+      } catch (e) {
+        showMsg(String(e.message || e), false);
+      } finally {
+        setBusy(false);
+      }
+    });
+  }
+
+  if ($('tgStopBtn')) {
+    $('tgStopBtn').addEventListener('click', function () {
+      stopTelegramPoll();
+      if ($('tgStatus')) $('tgStatus').textContent = '已停止等待';
+      showMsg('已停止等待 Telegram', true);
+    });
+  }
 
   $('configForm').addEventListener('submit', async function (ev) {
     ev.preventDefault();
@@ -1950,17 +2197,8 @@
     }
   });
 
-  $('logoutBtn').addEventListener('click', async function () {
-    setBusy(true);
-    try {
-      var data = await api('/api/logout', { method: 'POST', body: '{}' });
-      if (data.status) fillForm(data.status);
-      showMsg('已清除本地登录 cookie', true);
-    } catch (e) {
-      showMsg(String(e.message || e), false);
-    } finally {
-      setBusy(false);
-    }
+  ['logoutBtn', 'logoutBtn2', 'logoutBtn3', 'logoutBtn4'].forEach(function (id) {
+    if ($(id)) $(id).addEventListener('click', runLogout);
   });
 
   $('pingBtn').addEventListener('click', async function () {
@@ -3246,6 +3484,8 @@
       // 官网规则：{{user}} = 登录用户 fullName（非邮箱、非手动填）
       var dn = (pre && pre.displayName) || '';
       if (dn) playState.userName = String(dn).trim();
+      // playerInfo 来自账号预设 settings，不是显示名
+      playState.playerInfo = String((pre && pre.playerInfo) || playState.playerInfo || '').trim();
       updatePlayPresetBtn();
       updatePlayUserLabel();
       if (cardPlayMode) renderPlayMessages();
@@ -3698,7 +3938,8 @@
     if ($('playStatus')) $('playStatus').textContent = '生成中…';
     if ($('playSuggest')) $('playSuggest').hidden = true;
 
-    var prompts = playState.messages.slice(0, -1).map(function (m) {
+    // prompts = 历史（去掉刚推入的 assistant 占位 + 当前 user）；content = 本轮
+    var prompts = playState.messages.slice(0, -2).map(function (m) {
       return { role: m.role === 'user' ? 'user' : 'assistant', content: m.content || '' };
     });
     var deep = !!($('playDeepThinking') && $('playDeepThinking').checked);
@@ -3715,7 +3956,7 @@
       style: playState.style || 'standard',
       imageGenerationModel: playState.imageGenerationModel || 'anime',
       presetIds: selectedPresetIds(),
-      playerInfo: playUserName(),
+      playerInfo: playState.playerInfo || '',
       prompts: prompts,
     };
 

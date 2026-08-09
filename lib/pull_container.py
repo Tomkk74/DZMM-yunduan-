@@ -37,7 +37,24 @@ def norm_path(p: str) -> str:
         p = "/" + p
     while "//" in p:
         p = p.replace("//", "/")
-    return p
+    parts = [part for part in p.split("/") if part not in ("", ".")]
+    if any(part == ".." for part in parts):
+        raise ValueError(f"非法路径（含 ..）: {p}")
+    return "/" + "/".join(parts) if parts else "/"
+
+
+def safe_local_path(out_dir: Path, remote: str) -> Path:
+    """Map a remote container path into out_dir; reject escapes outside out_dir."""
+    root = Path(out_dir).resolve()
+    rel = norm_path(remote).lstrip("/")
+    if not rel:
+        raise ValueError(f"非法路径: {remote}")
+    local = root.joinpath(*rel.split("/")).resolve()
+    try:
+        local.relative_to(root)
+    except ValueError as e:
+        raise ValueError(f"路径越界: {remote}") from e
+    return local
 
 
 def walk(cookie, token, game_id: str, path: str = "/") -> list[dict]:
@@ -71,12 +88,25 @@ def download_raw(cookie, token, game_id: str, remote: str) -> bytes:
 
 
 def default_out_dir(character_id: int) -> Path:
+    """Prefer configured project_path only when it belongs to the same card."""
     s.refresh_root()
     cfg = s.load_config()
     raw = (cfg.get("project_path") or "").strip()
     if raw:
-        return Path(raw).expanduser().resolve()
-    # 默认落到工具旁：../{character_id}
+        path = Path(raw).expanduser().resolve()
+        meta_cid = int(read_pull_meta(path).get("character_id") or 0)
+        sync_meta = {}
+        try:
+            sync_path = path / "_sync_meta.json"
+            if sync_path.is_file():
+                sync_meta = json.loads(sync_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            sync_meta = {}
+        sync_cid = int(sync_meta.get("character_id") or 0) if isinstance(sync_meta, dict) else 0
+        bound = meta_cid or sync_cid
+        if not bound or bound == int(character_id):
+            return path
+    # 换卡或未配置：落到工具旁 ../{character_id}
     return (KIT.parent / str(character_id)).resolve()
 
 
@@ -155,10 +185,9 @@ def pull_paths(
     ok = fail = 0
     failed_paths: list[str] = []
     for i, remote in enumerate(remote_paths, 1):
-        rel = remote.lstrip("/").replace("\\", "/")
-        local = out_dir.joinpath(*rel.split("/")) if rel else out_dir
-        local.parent.mkdir(parents=True, exist_ok=True)
         try:
+            local = safe_local_path(out_dir, remote)
+            local.parent.mkdir(parents=True, exist_ok=True)
             data = download_raw(cookie, token, game_id, remote)
             local.write_bytes(data)
             ok += 1
@@ -191,39 +220,50 @@ def pull_paths(
     file_set = set(prev_files)
     for p in remote_paths:
         file_set.add(p)
+    this_failed = set(failed_paths)
+    attempted = set(remote_paths)
+    succeeded = attempted - this_failed
+    if mode == "retry":
+        # 保留未重试到的旧失败 + 本轮仍失败的
+        prev_failed = {norm_path(str(p)) for p in (prev.get("failed_paths") or []) if p}
+        merged_failed = sorted((prev_failed - succeeded) | this_failed)
+    else:
+        merged_failed = sorted(this_failed)
     meta = {
         "character_id": character_id,
         "game_id": game_id,
         "workbench": f"{s.ORIGIN}/studio/game-creation/workbench?character_id={character_id}",
         "out": str(out_dir),
         "pulled_files": int(prev.get("pulled_files") or 0) + ok if mode == "retry" else ok,
-        "failed": fail,
-        "failed_paths": failed_paths,
+        "failed": len(merged_failed),
+        "failed_paths": merged_failed,
         "files": sorted(file_set),
         "last_mode": mode,
     }
     write_pull_meta(out_dir, meta)
     s.save_config({"character_id": character_id, "project_path": str(out_dir)})
-    # 拉取完成后建立增量 sync 基线，避免下次误传全量
-    try:
-        s.refresh_root()
-        s.write_sync_baseline()
-    except Exception:
-        pass
+    # 仅全量成功时建立 sync 基线，避免把半拉状态当成已同步
+    if fail == 0:
+        try:
+            s.refresh_root()
+            s.write_sync_baseline()
+        except Exception:
+            pass
 
     summary = {
-        "ok": fail == 0,
+        "ok": len(merged_failed) == 0,
         "characterId": character_id,
         "gameId": game_id,
         "out": str(out_dir),
         "total": total,
         "pulled": ok,
-        "failed": fail,
-        "failedPaths": failed_paths,
+        "failed": len(merged_failed),
+        "failedPaths": merged_failed,
         "mode": mode,
         "workbenchUrl": meta["workbench"],
         "message": (
-            f"{'重试完成' if mode == 'retry' else '拉取完成'} ok={ok} fail={fail} → {out_dir}"
+            f"{'重试完成' if mode == 'retry' else '拉取完成'} "
+            f"ok={ok} fail={len(merged_failed)} → {out_dir}"
         ),
     }
     emit({"phase": "done", **summary})

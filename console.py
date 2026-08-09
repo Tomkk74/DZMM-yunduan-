@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import mimetypes
 import subprocess
@@ -69,6 +70,37 @@ _SYNC_JOB: dict = {
     "fails": [],
     "gameId": "",
 }
+
+
+_JOB_CLAIM_LOCK = threading.Lock()
+
+
+def _project_job_busy() -> str:
+    """Return 'sync' / 'pull' if a project-mutating job is running."""
+    with _SYNC_LOCK:
+        if _SYNC_JOB.get("running"):
+            return "sync"
+    with _PULL_LOCK:
+        if _PULL_JOB.get("running"):
+            return "pull"
+    return ""
+
+
+def _claim_project_job(kind: str, init: dict) -> str:
+    """Atomically claim sync or pull. Returns '' on success, or busy kind."""
+    with _JOB_CLAIM_LOCK:
+        busy = _project_job_busy()
+        if busy:
+            return busy
+        if kind == "sync":
+            with _SYNC_LOCK:
+                _SYNC_JOB.update(init)
+        elif kind == "pull":
+            with _PULL_LOCK:
+                _PULL_JOB.update(init)
+        else:
+            return "busy"
+        return ""
 
 
 def _json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
@@ -191,16 +223,13 @@ def do_origin_set(body: dict) -> dict:
     }
 
 
-def do_login(body: dict) -> dict:
-    email = str(body.get("email") or "").strip()
-    password = str(body.get("password") or "")
-    save_password = bool(body.get("savePassword", True))
+def _apply_login_side_config(body: dict) -> None:
+    """登录请求里可顺带带上线路 / 项目字段。"""
+    updates = {}
     character_id = body.get("characterId")
     project_path = body.get("projectPath")
     preview_port = body.get("previewPort")
     origin = body.get("origin")
-
-    updates = {}
     if character_id is not None and str(character_id).strip() != "":
         updates["character_id"] = int(character_id)
     if project_path is not None:
@@ -213,13 +242,31 @@ def do_login(body: dict) -> dict:
     if updates:
         studio.save_config(updates)
 
+
+def _login_success(email_hint: str | None = None) -> dict:
+    studio.refresh_root()
+    _c, _t, remain, mail = studio.load_auth(min_remain=0)
+    return {
+        "ok": True,
+        "email": mail or email_hint or "",
+        "remainSec": remain,
+        "status": build_status(),
+    }
+
+
+def do_login(body: dict) -> dict:
+    email = str(body.get("email") or "").strip()
+    password = str(body.get("password") or "")
+    save_password = bool(body.get("savePassword", True))
+    _apply_login_side_config(body)
+
     env = studio._read_env_map()
     if not email:
         email = (env.get("email") or "").strip()
     if not password:
         password = env.get("password") or ""
     if not email or not password:
-        return {"ok": False, "error": "请填写邮箱和密码"}
+        return {"ok": False, "error": "请填写邮箱和密码（或改用登录码 / Telegram / Cookie）"}
 
     try:
         fresh = studio.login_with_password(email, password)
@@ -228,12 +275,93 @@ def do_login(body: dict) -> dict:
             email=email,
             password=password if save_password else "",
         )
-        studio.refresh_root()
-        _c, _t, remain, mail = studio.load_auth(min_remain=0)
+        return _login_success(email)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_login_cookie(body: dict) -> dict:
+    _apply_login_side_config(body)
+    cookie = str(body.get("cookie") or "").strip()
+    if not cookie:
+        return {"ok": False, "error": "请粘贴 Cookie（sb-rls-auth-token=… 或浏览器整段 Cookie）"}
+    try:
+        fresh = studio.login_with_cookie(cookie)
+        # 尽量从 cookie 里抠邮箱
+        mail = ""
+        try:
+            tok = studio._session_from_cookie(fresh)
+            mail = str((tok.get("user") or {}).get("email") or "")
+        except Exception:
+            pass
+        studio._save_env(cookie=fresh, email=mail or None)
+        return _login_success(mail)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_login_code(body: dict) -> dict:
+    """登录码图片：imageBase64 + 可选 filename。"""
+    _apply_login_side_config(body)
+    b64 = str(body.get("imageBase64") or "").strip()
+    if not b64:
+        return {"ok": False, "error": "请上传登录码图片"}
+    if "," in b64 and b64.lower().startswith("data:"):
+        b64 = b64.split(",", 1)[1]
+    try:
+        raw = base64.b64decode(b64, validate=False)
+    except Exception as e:
+        return {"ok": False, "error": f"图片解码失败：{e}"}
+    filename = str(body.get("filename") or "sign-in-code.jpg").strip() or "sign-in-code.jpg"
+    try:
+        fresh = studio.login_with_signin_code_image(raw, filename)
+        mail = ""
+        try:
+            tok = studio._session_from_cookie(fresh)
+            mail = str((tok.get("user") or {}).get("email") or "")
+        except Exception:
+            pass
+        studio._save_env(cookie=fresh, email=mail or None)
+        return _login_success(mail)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_login_telegram_start(body: dict | None = None) -> dict:
+    body = body or {}
+    _apply_login_side_config(body)
+    try:
+        data = studio.tg_create_sign_in_code()
+        return {"ok": True, **data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_login_telegram_poll(body: dict) -> dict:
+    code = str(body.get("signInCode") or "").strip()
+    if not code:
+        return {"ok": False, "error": "缺少 signInCode"}
+    try:
+        data = studio.tg_poll_sign_in_code(code)
+        if data.get("loggedIn") and data.get("cookie"):
+            fresh = data["cookie"]
+            mail = ""
+            try:
+                tok = studio._session_from_cookie(fresh)
+                mail = str((tok.get("user") or {}).get("email") or "")
+            except Exception:
+                pass
+            studio._save_env(cookie=fresh, email=mail or None)
+            out = _login_success(mail)
+            out["loggedIn"] = True
+            out["tgStatus"] = data.get("status")
+            out["message"] = data.get("message") or ""
+            return out
         return {
             "ok": True,
-            "email": mail,
-            "remainSec": remain,
+            "loggedIn": False,
+            "tgStatus": data.get("status"),
+            "message": data.get("message") or "",
             "status": build_status(),
         }
     except Exception as e:
@@ -359,6 +487,14 @@ def _finish_pull_summary(summary: dict) -> None:
             _PULL_JOB["error"] = ""
 
 
+def _fail_pull_job(prefix: str, err: BaseException) -> None:
+    with _PULL_LOCK:
+        _PULL_JOB["running"] = False
+        _PULL_JOB["done"] = True
+        _PULL_JOB["error"] = str(err)
+        _PULL_JOB["message"] = f"{prefix}：{err}"
+
+
 def _run_pull_job(character_id: int, out: str | None) -> None:
     try:
         out_path = Path(out).expanduser() if out else None
@@ -368,12 +504,10 @@ def _run_pull_job(character_id: int, out: str | None) -> None:
             on_progress=_pull_progress,
         )
         _finish_pull_summary(summary)
+    except SystemExit as e:
+        _fail_pull_job("拉取失败", e)
     except Exception as e:
-        with _PULL_LOCK:
-            _PULL_JOB["running"] = False
-            _PULL_JOB["done"] = True
-            _PULL_JOB["error"] = str(e)
-            _PULL_JOB["message"] = f"拉取失败：{e}"
+        _fail_pull_job("拉取失败", e)
 
 
 def _run_retry_failed_job(character_id: int, out: str | None, failed_paths: list[str] | None) -> None:
@@ -386,12 +520,10 @@ def _run_retry_failed_job(character_id: int, out: str | None, failed_paths: list
             failed_paths=failed_paths,
         )
         _finish_pull_summary(summary)
+    except SystemExit as e:
+        _fail_pull_job("重试失败", e)
     except Exception as e:
-        with _PULL_LOCK:
-            _PULL_JOB["running"] = False
-            _PULL_JOB["done"] = True
-            _PULL_JOB["error"] = str(e)
-            _PULL_JOB["message"] = f"重试失败：{e}"
+        _fail_pull_job("重试失败", e)
 
 
 def _resolve_pull_target(body: dict, status: dict) -> tuple[int, str]:
@@ -404,9 +536,13 @@ def _resolve_pull_target(body: dict, status: dict) -> tuple[int, str]:
         cid = 0
     out = str(body.get("projectPath") or body.get("out") or "").strip()
     if not out:
-        out = str(status.get("projectPath") or "").strip()
-    if not out and cid:
-        out = str(puller.default_out_dir(cid))
+        # 走 default_out_dir：换卡时不会误用旧卡目录
+        out = str(puller.default_out_dir(cid)) if cid else ""
+    elif cid:
+        path = Path(out).expanduser().resolve()
+        meta_cid = int(puller.read_pull_meta(path).get("character_id") or 0)
+        if meta_cid and meta_cid != cid:
+            out = str(puller.default_out_dir(cid))
     return cid, out
 
 
@@ -424,28 +560,25 @@ def do_start_pull(body: dict) -> dict:
         "project_path": out or str(puller.default_out_dir(cid)),
     })
 
-    with _PULL_LOCK:
-        if _PULL_JOB.get("running"):
-            pull_busy = True
-        else:
-            pull_busy = False
-            _PULL_JOB.update({
-                "running": True,
-                "phase": "start",
-                "message": "开始拉取容器…",
-                "current": 0,
-                "total": 0,
-                "ok": 0,
-                "fail": 0,
-                "failedPaths": [],
-                "mode": "full",
-                "out": out or str(puller.default_out_dir(cid)),
-                "error": "",
-                "done": False,
-                "result": None,
-                "logs": ["开始拉取容器完整项目…"],
-            })
-    if pull_busy:
+    claim = _claim_project_job("pull", {
+        "running": True,
+        "phase": "start",
+        "message": "开始拉取容器…",
+        "current": 0,
+        "total": 0,
+        "ok": 0,
+        "fail": 0,
+        "failedPaths": [],
+        "mode": "full",
+        "out": out or str(puller.default_out_dir(cid)),
+        "error": "",
+        "done": False,
+        "result": None,
+        "logs": ["开始拉取容器完整项目…"],
+    })
+    if claim == "sync":
+        return {"ok": False, "error": "同步进行中，请稍后再拉取", "job": pull_job_snapshot(), "status": status}
+    if claim:
         return {"ok": False, "error": "已有拉取任务进行中", "job": pull_job_snapshot(), "status": status}
 
     thread = threading.Thread(
@@ -490,28 +623,25 @@ def do_retry_failed_pull(body: dict) -> dict:
 
     studio.save_config({"character_id": cid, "project_path": out})
 
-    with _PULL_LOCK:
-        if _PULL_JOB.get("running"):
-            pull_busy = True
-        else:
-            pull_busy = False
-            _PULL_JOB.update({
-                "running": True,
-                "phase": "start",
-                "message": f"重试失败文件 {len(failed_paths)} 个…",
-                "current": 0,
-                "total": len(failed_paths),
-                "ok": 0,
-                "fail": 0,
-                "failedPaths": list(failed_paths),
-                "mode": "retry",
-                "out": out,
-                "error": "",
-                "done": False,
-                "result": None,
-                "logs": [f"只重拉失败文件（{len(failed_paths)}）…"],
-            })
-    if pull_busy:
+    claim = _claim_project_job("pull", {
+        "running": True,
+        "phase": "start",
+        "message": f"重试失败文件 {len(failed_paths)} 个…",
+        "current": 0,
+        "total": len(failed_paths),
+        "ok": 0,
+        "fail": 0,
+        "failedPaths": list(failed_paths),
+        "mode": "retry",
+        "out": out,
+        "error": "",
+        "done": False,
+        "result": None,
+        "logs": [f"只重拉失败文件（{len(failed_paths)}）…"],
+    })
+    if claim == "sync":
+        return {"ok": False, "error": "同步进行中，请稍后再重试拉取", "job": pull_job_snapshot(), "status": status}
+    if claim:
         return {"ok": False, "error": "已有拉取任务进行中", "job": pull_job_snapshot(), "status": status}
 
     thread = threading.Thread(
@@ -668,18 +798,18 @@ def do_bridge_status() -> dict:
 
 def do_bridge_publish(body: dict) -> dict:
     preview = preview_snapshot()
+    status = build_status()
+    cfg_cid = int(status.get("characterId") or 0)
     if not preview.get("running"):
         # 预览未开时，直接走 studio publish
-        status = build_status()
         if not status["loggedIn"]:
             return {"ok": False, "error": "尚未登录"}
-        cid = int(status.get("characterId") or 0)
-        if not cid:
+        if not cfg_cid:
             return {"ok": False, "error": "缺少 character_id"}
         try:
             cookie, token, remain, email = studio.load_auth()
-            studio.ensure_editor(cookie, token, cid)
-            studio.publish(cookie, token, cid)
+            studio.ensure_editor(cookie, token, cfg_cid)
+            studio.publish(cookie, token, cfg_cid)
             return {
                 "ok": True,
                 "message": "已发布到线上玩家版",
@@ -692,7 +822,30 @@ def do_bridge_publish(body: dict) -> dict:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    prev_cid = int(preview.get("characterId") or 0)
+    if prev_cid and cfg_cid and prev_cid != cfg_cid:
+        return {
+            "ok": False,
+            "error": (
+                f"预览仍绑定旧卡 {prev_cid}，当前配置为 {cfg_cid}。"
+                "请先停止并重新启动预览后再发布。"
+            ),
+            "preview": preview,
+        }
+
     try:
+        health = _preview_http_json("/health")
+        live_cid = int((health or {}).get("characterId") or 0)
+        if live_cid and cfg_cid and live_cid != cfg_cid:
+            return {
+                "ok": False,
+                "error": (
+                    f"预览进程实际绑定卡 {live_cid}，当前配置为 {cfg_cid}。"
+                    "请停止预览并重新启动后再发布。"
+                ),
+                "preview": preview,
+                "bridge": health,
+            }
         job = _preview_http_json(
             "/_dzmm/studio/publish",
             method="POST",
@@ -775,7 +928,8 @@ def _run_sync_job(cid: int, message: str, only, full: bool = False) -> None:
                 total=0,
             )
             return
-        if not to_upload:
+        git_pending = bool(meta.get("gitSavePending"))
+        if not to_upload and not git_pending:
             _sync_set(
                 running=False,
                 done=True,
@@ -789,61 +943,90 @@ def _run_sync_job(cid: int, message: str, only, full: bool = False) -> None:
             )
             return
 
-        total = len(to_upload)
-        upload_label = "全量上传" if mode in ("full", "retarget") else "增量上传"
-        if mode == "retarget":
-            upload_label = "换卡全量上传"
-        _sync_set(
-            phase="upload",
-            message=f"{upload_label} 0/{total}（共扫描 {len(files)}）",
-            current=0,
-            total=total,
-        )
         ok = fail = 0
         fails: list[str] = []
-        entries = dict(meta.get("files") or {})
-        for i, path in enumerate(to_upload, start=1):
-            rel = path.relative_to(studio.ROOT).as_posix()
-            try:
-                studio.upload_file(cookie, token, game_id, path)
-                entries[rel] = studio._file_sig(path)
-                ok += 1
-            except Exception as e:
-                fail += 1
-                if len(fails) < 8:
-                    fails.append(f"{rel}: {e}")
+        if to_upload:
+            total = len(to_upload)
+            upload_label = "全量上传" if mode in ("full", "retarget") else "增量上传"
+            if mode == "retarget":
+                upload_label = "换卡全量上传"
             _sync_set(
-                current=i,
-                ok=ok,
-                fail=fail,
-                fails=list(fails),
-                message=f"{upload_label} {i}/{total}" + (f"（失败 {fail}）" if fail else ""),
+                phase="upload",
+                message=f"{upload_label} 0/{total}（共扫描 {len(files)}）",
+                current=0,
+                total=total,
             )
+            # 全量/换卡只记录本轮成功签名，避免失败项沿用旧哈希后被永久跳过
+            entries = {} if mode in ("full", "retarget") else dict(meta.get("files") or {})
+            for i, path in enumerate(to_upload, start=1):
+                rel = path.relative_to(studio.ROOT).as_posix()
+                try:
+                    studio.upload_file(cookie, token, game_id, path)
+                    entries[rel] = studio._file_sig(path)
+                    ok += 1
+                except Exception as e:
+                    fail += 1
+                    entries.pop(rel, None)
+                    if len(fails) < 8:
+                        fails.append(f"{rel}: {e}")
+                _sync_set(
+                    current=i,
+                    ok=ok,
+                    fail=fail,
+                    fails=list(fails),
+                    message=f"{upload_label} {i}/{total}" + (f"（失败 {fail}）" if fail else ""),
+                )
+            meta["files"] = entries
+            meta["character_id"] = cid
+            studio.save_sync_meta(meta)
+            if fail:
+                _sync_set(
+                    running=False,
+                    done=True,
+                    phase="error",
+                    error=f"部分失败：成功 {ok}，失败 {fail}（失败文件下次会重试）",
+                    message=f"同步结束：成功 {ok}，失败 {fail}",
+                    ok=ok,
+                    fail=fail,
+                    fails=fails,
+                )
+                return
+        else:
+            _sync_set(phase="git", message="无文件变更，补做容器 git save…", total=0, current=0)
 
-        meta["files"] = entries
-        meta["character_id"] = cid
-        studio.save_sync_meta(meta)
-
-        if fail:
+        done_label = {
+            "retarget": "换卡全量同步",
+            "full": "全量同步",
+        }.get(mode, "增量同步")
+        if not to_upload and git_pending:
+            done_label = "补做 git save"
+        _sync_set(phase="git", message="保存容器 git…")
+        try:
+            studio.git_save(cookie, token, game_id, message)
+            meta["gitSavePending"] = False
+            meta.pop("gitSavePending", None)
+            meta["character_id"] = cid
+            studio.save_sync_meta(meta)
+        except Exception as e:
+            meta["gitSavePending"] = True
+            meta["character_id"] = cid
+            studio.save_sync_meta(meta)
             _sync_set(
                 running=False,
                 done=True,
                 phase="error",
-                error=f"部分失败：成功 {ok}，失败 {fail}",
-                message=f"同步结束：成功 {ok}，失败 {fail}",
+                error=f"文件已上传，但 git save 失败：{e}（下次同步会重试）",
+                message="git save 失败，已标记待重试",
                 ok=ok,
-                fail=fail,
-                fails=fails,
+                fail=1,
+                fails=[str(e)],
             )
             return
-
-        _sync_set(phase="git", message="保存容器 git…")
-        studio.git_save(cookie, token, game_id, message)
         _sync_set(
             running=False,
             done=True,
             phase="done",
-            message=f"已增量同步 {ok} 个文件并保存",
+            message=f"已{done_label} {ok} 个文件并保存",
             ok=ok,
             fail=0,
             error="",
@@ -880,25 +1063,22 @@ def do_start_sync(body: dict) -> dict:
     only = (body or {}).get("only")
     full = bool((body or {}).get("full"))
 
-    with _SYNC_LOCK:
-        if _SYNC_JOB.get("running"):
-            busy = True
-        else:
-            busy = False
-            _SYNC_JOB.update({
-                "running": True,
-                "phase": "start",
-                "message": "正在启动同步…",
-                "current": 0,
-                "total": 0,
-                "ok": 0,
-                "fail": 0,
-                "error": "",
-                "done": False,
-                "fails": [],
-                "gameId": "",
-            })
-    if busy:
+    claim = _claim_project_job("sync", {
+        "running": True,
+        "phase": "start",
+        "message": "正在启动同步…",
+        "current": 0,
+        "total": 0,
+        "ok": 0,
+        "fail": 0,
+        "error": "",
+        "done": False,
+        "fails": [],
+        "gameId": "",
+    })
+    if claim == "pull":
+        return {"ok": False, "error": "拉取进行中，请稍后再同步", "job": sync_job_snapshot()}
+    if claim:
         return {"ok": False, "error": "已有同步任务进行中", "job": sync_job_snapshot()}
 
     thread = threading.Thread(
@@ -1190,7 +1370,14 @@ def do_card_save(body: dict) -> dict:
                 base["_meta"].update(body["meta"])
             card = base
         brief = str(body.get("brief") or (card.get("_meta") or {}).get("brief") or "")
-        saved = character.save_local(card, local_id=str(local_id or "").strip() or None)
+        prev = str(body.get("previousLocalId") or body.get("fromLocalId") or "").strip() or None
+        force = bool(body.get("force") or body.get("forceOverwrite"))
+        saved = character.save_local(
+            card,
+            local_id=str(local_id or "").strip() or None,
+            previous_local_id=prev,
+            force=force,
+        )
         # 再写一遍 brief（save_local 已带 meta.brief；这里保证 body.brief 优先生效）
         if brief:
             saved = character.write_folder(saved["card"], local_id=saved["localId"], brief=brief)
@@ -1385,7 +1572,7 @@ def do_card_delete_cloud(body: dict) -> dict:
                 character_id = None
         also_hide = body.get("alsoHidePublished")
         if also_hide is None:
-            also_hide = True
+            also_hide = False
         cascade = body.get("cascadeDrafts")
         if cascade is None:
             cascade = True
@@ -1829,6 +2016,22 @@ class Handler(BaseHTTPRequestHandler):
         body = _read_body(self)
         if path == "/api/login":
             result = do_login(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/login/cookie":
+            result = do_login_cookie(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/login/code":
+            result = do_login_code(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/login/telegram/start":
+            result = do_login_telegram_start(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/login/telegram/poll":
+            result = do_login_telegram_poll(body)
             _json(self, 200 if result.get("ok") else 400, result)
             return
         if path == "/api/origin":

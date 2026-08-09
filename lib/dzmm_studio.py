@@ -8,7 +8,11 @@ Auth (.env, gitignored):
   cookie=sb-rls-auth-token=base64-...   # optional; auto-refreshed / rewritten
 
 Access token ~1h；脚本会在快过期时用 cookie 调 GET /api/auth/token 自动续期。
-refresh 失效或没有 cookie 时，用 email+password 调 POST /api/auth/sign-in。
+refresh 失效或没有 cookie 时，可用：
+  - email+password → POST /api/auth/sign-in
+  - 登录码图片 → POST /api/auth/sign-in-code/scan
+  - Telegram 扫码 → /api/auth/tg-sign-in-code + 轮询
+  - 粘贴浏览器 Cookie（assemble_auth_cookie）
 
 Target workbench: https://www.dzmm.ai/studio/game-creation/workbench?character_id=<id>
 """
@@ -19,6 +23,7 @@ import base64
 import hashlib
 import json
 import mimetypes
+import re
 import sys
 import time
 import urllib.error
@@ -189,20 +194,34 @@ def pick_fastest_origin(timeout: float = 6.0) -> dict:
     }
 
 
+_CONFIG_LOAD_ERROR = ""
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
 def load_config() -> dict:
+    global _CONFIG_LOAD_ERROR
     cfg: dict = {
         "character_id": 0,
         "project_path": "",
         "preview_port": 8791,
         "origin": DEFAULT_ORIGIN,
     }
+    _CONFIG_LOAD_ERROR = ""
     if CONFIG_PATH.exists():
         try:
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 cfg.update(data)
-        except Exception:
-            pass
+            else:
+                _CONFIG_LOAD_ERROR = "config.json 不是对象"
+        except Exception as e:
+            _CONFIG_LOAD_ERROR = f"config.json 损坏: {e}"
     env = _read_env_map_raw()
     if env.get("character_id") and not cfg.get("character_id"):
         try:
@@ -399,8 +418,11 @@ def normalize_project_root(raw) -> Path:
 
 
 def save_config(updates: dict) -> dict:
-    global ORIGIN
+    global ORIGIN, _CONFIG_LOAD_ERROR
     cfg = load_config()
+    if _CONFIG_LOAD_ERROR and CONFIG_PATH.exists():
+        # 损坏时拒绝覆盖，避免把 character_id / project_path 冲成默认值
+        raise RuntimeError(f"{_CONFIG_LOAD_ERROR}；请先修复或删除 config.json 后再保存")
     cfg.update({k: v for k, v in updates.items() if v is not None})
     if "character_id" in cfg:
         try:
@@ -417,7 +439,8 @@ def save_config(updates: dict) -> dict:
     if cfg.get("origin"):
         cfg["origin"] = normalize_origin(cfg["origin"])
         ORIGIN = cfg["origin"]
-    CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _atomic_write_text(CONFIG_PATH, json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
+    _CONFIG_LOAD_ERROR = ""
     return cfg
 
 
@@ -501,17 +524,109 @@ def _read_env_map() -> dict[str, str]:
     return _read_env_map_raw()
 
 
+COOKIE_NAME = "sb-rls-auth-token"
+
+
+def _finalize_cookie(value: str) -> str:
+    """把 session value 规范成 `sb-rls-auth-token=base64-...`。"""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if value.lower().startswith("cookie="):
+        value = value[len("cookie=") :].strip()
+    while value.startswith(f"{COOKIE_NAME}={COOKIE_NAME}="):
+        value = value[len(f"{COOKIE_NAME}=") :]
+    if value.startswith(f"{COOKIE_NAME}="):
+        value = value.split("=", 1)[1]
+    if value.startswith("eyJ") and not value.startswith("base64-"):
+        value = "base64-" + value
+    if not value.startswith("base64-") and not value.startswith("eyJ"):
+        # 已是完整 JSON base64 或其它；仍挂上名字
+        pass
+    if value.startswith("base64-") or value.startswith("eyJ"):
+        return f"{COOKIE_NAME}={value if value.startswith('base64-') else 'base64-' + value}"
+    return f"{COOKIE_NAME}={value}"
+
+
+def assemble_auth_cookie(raw: str) -> str:
+    """把浏览器复制的 Cookie 头 / 多行 / 分段 (.0/.1) 组装成完整单条 cookie。
+
+    支持：
+    - sb-rls-auth-token=base64-...
+    - sb-rls-auth-token.0=... + .1=...（Supabase 超长 session 分片）
+    - 仅 value（base64-... / eyJ...）
+    - 整段 Cookie: a=1; sb-rls-auth-token=...; 其它=...
+    """
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    if text.lower().startswith("cookie:"):
+        text = text.split(":", 1)[1].strip()
+
+    parts: list[str] = []
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if ";" in line and "=" in line:
+            parts.extend(p.strip() for p in line.split(";") if p.strip())
+        else:
+            parts.append(line)
+
+    single = ""
+    chunks: dict[int, str] = {}
+    bare_values: list[str] = []
+    for part in parts:
+        if "=" not in part:
+            bare_values.append(part.strip().strip('"'))
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        value = value.strip().strip('"')
+        if name == COOKIE_NAME:
+            single = value
+            continue
+        if name.startswith(COOKIE_NAME + "."):
+            suffix = name[len(COOKIE_NAME) + 1 :]
+            if suffix.isdigit():
+                chunks[int(suffix)] = value
+                continue
+        # 其它 sb-*-auth-token（容错）
+        if re.fullmatch(r"sb-[A-Za-z0-9_-]+-auth-token", name):
+            if not single:
+                single = value
+            continue
+        m = re.fullmatch(r"(sb-[A-Za-z0-9_-]+-auth-token)\.(\d+)", name)
+        if m:
+            chunks[int(m.group(2))] = value
+
+    if chunks:
+        value = "".join(chunks[i] for i in sorted(chunks))
+    elif single:
+        value = single
+    elif bare_values:
+        value = "".join(bare_values)
+    else:
+        return ""
+    return _finalize_cookie(value)
+
+
 def _normalize_cookie(cookie: str) -> str:
     cookie = (cookie or "").strip()
-    if cookie.lower().startswith("cookie="):
-        cookie = cookie[len("cookie=") :].strip()
-    while cookie.startswith("sb-rls-auth-token=sb-rls-auth-token="):
-        cookie = cookie[len("sb-rls-auth-token=") :]
-    if cookie.startswith("base64-") or cookie.startswith("eyJ"):
-        cookie = f"sb-rls-auth-token={cookie if cookie.startswith('base64-') else 'base64-' + cookie}"
-    if cookie and not cookie.startswith("sb-rls-auth-token="):
-        cookie = f"sb-rls-auth-token={cookie}"
-    return cookie
+    if not cookie:
+        return ""
+    # 整段头 / 多行 / 分片 → 先组装
+    if (
+        cookie.lower().startswith("cookie:")
+        or ("\n" in cookie)
+        or (";" in cookie)
+        or (f"{COOKIE_NAME}." in cookie)
+        or re.search(r"sb-[A-Za-z0-9_-]+-auth-token\.\d+", cookie)
+    ):
+        assembled = assemble_auth_cookie(cookie)
+        if assembled:
+            return assembled
+    return _finalize_cookie(cookie)
 
 
 def _session_from_cookie(cookie: str) -> dict:
@@ -521,14 +636,38 @@ def _session_from_cookie(cookie: str) -> dict:
     b64 = cookie.split("=", 1)[1]
     payload = b64[len("base64-") :] if b64.startswith("base64-") else b64
     payload += "=" * ((-len(payload)) % 4)
-    return json.loads(base64.b64decode(payload))
+    # urlsafe 兼容
+    try:
+        return json.loads(base64.b64decode(payload))
+    except Exception:
+        return json.loads(base64.urlsafe_b64decode(payload))
 
 
 def _cookie_from_jar(jar: CookieJar) -> str | None:
+    single = ""
+    chunks: dict[int, str] = {}
     for c in jar:
-        if c.name == "sb-rls-auth-token" and c.value:
-            return _normalize_cookie(f"{c.name}={c.value}")
+        if not c.name or not c.value:
+            continue
+        if c.name == COOKIE_NAME:
+            single = c.value
+            continue
+        if c.name.startswith(COOKIE_NAME + "."):
+            suffix = c.name[len(COOKIE_NAME) + 1 :]
+            if suffix.isdigit():
+                chunks[int(suffix)] = c.value
+    if chunks:
+        return _normalize_cookie("".join(chunks[i] for i in sorted(chunks)))
+    if single:
+        return _normalize_cookie(f"{COOKIE_NAME}={single}")
     return None
+
+
+def current_auth_cookie() -> str:
+    """返回本机已保存的完整 cookie（已归一化）。"""
+    env = _read_env_map()
+    raw = (env.get("cookie") or "").strip()
+    return _normalize_cookie(raw) if raw else ""
 
 
 def _save_env(
@@ -566,7 +705,7 @@ def _save_env(
         if k in ("email", "password", "cookie"):
             continue
         lines.append(f"{k}={v}")
-    ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _atomic_write_text(ENV_PATH, "\n".join(lines) + "\n")
 
 
 def _auth_request(url: str, *, method: str = "GET", data=None, cookie: str | None = None, referer: str | None = None):
@@ -630,10 +769,155 @@ def login_with_password(email: str, password: str) -> str:
         return new_cookie
     err = raw[:300]
     try:
-        err = json.loads(raw).get("error") or json.loads(raw).get("message") or err
+        j = json.loads(raw)
+        err = j.get("error") or j.get("message") or err
     except Exception:
         pass
     raise RuntimeError(f"login failed HTTP {st}: {err}")
+
+
+def login_with_cookie(cookie: str) -> str:
+    """粘贴浏览器 Cookie / sb-rls-auth-token 值，校验并可自动 refresh。"""
+    c = _normalize_cookie(cookie or "")
+    if not c:
+        raise RuntimeError("Cookie 为空：请粘贴 sb-rls-auth-token=base64-... 或整段 Cookie 头")
+    try:
+        tok = _session_from_cookie(c)
+    except Exception as e:
+        raise RuntimeError(f"Cookie 无法解析：{e}") from e
+    remain = int(tok.get("expires_at", 0) - time.time())
+    if remain < AUTH_REFRESH_SKEW:
+        try:
+            return refresh_session_cookie(c)
+        except Exception as e:
+            if remain > 30:
+                return c
+            raise RuntimeError(f"Cookie 已过期且刷新失败：{e}") from e
+    # 顺带打一下 token 接口，确认线路可用；失败仍可先收下本地 cookie
+    try:
+        return refresh_session_cookie(c)
+    except Exception:
+        return c
+
+
+def _multipart_body(fields: dict[str, tuple[str, bytes, str]]) -> tuple[bytes, str]:
+    """fields: name -> (filename, content, content_type)"""
+    boundary = f"----DZMMFormBoundary{int(time.time() * 1000)}"
+    chunks: list[bytes] = []
+    for name, (filename, content, ctype) in fields.items():
+        chunks.append(f"--{boundary}\r\n".encode())
+        disp = f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+        chunks.append(disp.encode())
+        chunks.append(f"Content-Type: {ctype}\r\n\r\n".encode())
+        chunks.append(content)
+        chunks.append(b"\r\n")
+    chunks.append(f"--{boundary}--\r\n".encode())
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def login_with_signin_code_image(image_bytes: bytes, filename: str = "sign-in-code.jpg") -> str:
+    """官方「使用登录码登录」：上传登录码截图/二维码图 → POST /api/auth/sign-in-code/scan。"""
+    if not image_bytes:
+        raise RuntimeError("请上传登录码图片")
+    name = (filename or "sign-in-code.jpg").strip() or "sign-in-code.jpg"
+    lower = name.lower()
+    if lower.endswith(".png"):
+        ctype = "image/png"
+    elif lower.endswith(".webp"):
+        ctype = "image/webp"
+    elif lower.endswith(".gif"):
+        ctype = "image/gif"
+    else:
+        ctype = "image/jpeg"
+        if not lower.endswith((".jpg", ".jpeg")):
+            name = "sign-in-code.jpg"
+    body, content_type = _multipart_body({"image": (name, image_bytes, ctype)})
+    jar = CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    origin = get_origin()
+    headers = {
+        "User-Agent": "Mozilla/5.0 DZMM-Studio-Bridge",
+        "Accept": "application/json",
+        "Origin": origin,
+        "Referer": f"{origin}/sign-in",
+        "Content-Type": content_type,
+        "x-dzmm-request-id": f"studio{int(time.time()) % 10_000_000}",
+    }
+    req = urllib.request.Request(
+        f"{origin}/api/auth/sign-in-code/scan",
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with opener.open(req, timeout=90) as resp:
+            st, raw = resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        st, raw = e.code, e.read()
+    new_cookie = _cookie_from_jar(jar)
+    if new_cookie:
+        return new_cookie
+    err = raw[:300]
+    try:
+        j = json.loads(raw.decode("utf-8", "replace"))
+        err = j.get("error") or j.get("message") or err
+    except Exception:
+        pass
+    raise RuntimeError(f"登录码登录失败 HTTP {st}: {err}")
+
+
+def tg_create_sign_in_code() -> dict:
+    """创建 Telegram 登录码（二维码 / bot 指令）。"""
+    st, raw, _jar = _auth_request(
+        f"{get_origin()}/api/auth/tg-sign-in-code",
+        method="GET",
+        referer=f"{get_origin()}/sign-in",
+    )
+    try:
+        data = json.loads(raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else raw)
+    except Exception as e:
+        raise RuntimeError(f"Telegram 取码失败 HTTP {st}: {raw[:200]!r}") from e
+    if st != 200 or not isinstance(data, dict) or not data.get("signInCode"):
+        msg = data.get("error") or data.get("message") if isinstance(data, dict) else raw[:200]
+        raise RuntimeError(f"Telegram 取码失败 HTTP {st}: {msg}")
+    return {
+        "signInCode": data.get("signInCode"),
+        "botUsername": data.get("botUsername") or "",
+        "qrCodeUrl": data.get("qrCodeUrl") or "",
+        "qrCodeSvg": data.get("qrCodeSvg") or "",
+        "createdAt": data.get("createdAt") or "",
+    }
+
+
+def tg_poll_sign_in_code(sign_in_code: str) -> dict:
+    """轮询 Telegram 登录状态；logged_in 时返回 cookie。"""
+    code = (sign_in_code or "").strip()
+    if not code:
+        raise RuntimeError("缺少 signInCode")
+    st, raw, jar = _auth_request(
+        f"{get_origin()}/api/auth/tg-sign-in-code/{urllib.parse.quote(code)}",
+        method="GET",
+        referer=f"{get_origin()}/sign-in",
+    )
+    try:
+        data = json.loads(raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else raw)
+    except Exception as e:
+        raise RuntimeError(f"Telegram 轮询失败 HTTP {st}: {raw[:200]!r}") from e
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Telegram 轮询异常 HTTP {st}")
+    status = str(data.get("status") or "")
+    cookie = _cookie_from_jar(jar)
+    out = {
+        "status": status,
+        "message": data.get("message") or "",
+        "cookie": cookie,
+        "loggedIn": status == "logged_in" and bool(cookie),
+    }
+    if status == "logged_in" and not cookie:
+        # 偶发只回 JSON、cookie 已在先前请求：再试 token 无 jar 仍空则报错
+        out["loggedIn"] = False
+        out["message"] = out["message"] or "已确认登录但未拿到 cookie，请改用 Cookie 粘贴或邮箱密码"
+    return out
 
 
 def load_auth(min_remain: int = 60):
@@ -673,8 +957,8 @@ def load_auth(min_remain: int = 60):
         return _ok(fresh)
 
     raise SystemExit(
-        "未登录：请在 .env 写上 email=... 与 password=...（推荐），"
-        "或粘贴 cookie=sb-rls-auth-token=base64-..."
+        "未登录：请在控制台用「邮箱密码 / 登录码 / Telegram / Cookie」登录，"
+        "或在 .env 写 email+password，或 cookie=sb-rls-auth-token=base64-..."
     )
 
 
@@ -799,7 +1083,9 @@ def save_sync_meta(meta: dict) -> None:
         "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "files": meta.get("files") if isinstance(meta.get("files"), dict) else {},
     }
-    path.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if meta.get("gitSavePending"):
+        out["gitSavePending"] = True
+    _atomic_write_text(path, json.dumps(out, ensure_ascii=False, indent=2) + "\n")
 
 
 def write_sync_baseline(files: list[Path] | None = None) -> dict:
@@ -822,6 +1108,19 @@ def write_sync_baseline(files: list[Path] | None = None) -> dict:
     return meta
 
 
+def _pull_meta_character_id() -> int:
+    path = ROOT / "_pull_meta.json"
+    if not path.is_file():
+        return 0
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return int(data.get("character_id") or 0)
+    except Exception:
+        pass
+    return 0
+
+
 def select_files_to_sync(
     files: list[Path],
     *,
@@ -831,8 +1130,8 @@ def select_files_to_sync(
     """选出需要上传的文件。
 
     - full=True：全部上传
-    - character_id 与 `_sync_meta.json` 记录不一致：换卡/换目标容器，强制全量
-    - 无基线：先写基线并返回空列表（假定刚拉取后本地=容器）
+    - character_id 与 `_sync_meta.json` 记录不一致（含旧 meta 缺 ID）：换卡全量
+    - 无基线：仅当 `_pull_meta.json` 同卡时只建基线；否则全量上传
     - 有基线：只返回 size/mtime/sha256 变化的文件
     """
     refresh_root()
@@ -843,16 +1142,20 @@ def select_files_to_sync(
         character_id if character_id is not None else (DEFAULT_CARD_ID or 0)
     )
     meta_cid = int(meta.get("character_id") or 0)
-    # 换了官方卡 ID 后，本地哈希往往未变，但远端是空白容器，必须全量推
-    if target_cid and meta_cid and target_cid != meta_cid:
+    # 换卡，或旧基线没有 character_id：本地哈希未变也不能当“已同步到当前卡”
+    if target_cid and prev and ((meta_cid and target_cid != meta_cid) or not meta_cid):
         meta = dict(meta)
         meta["character_id"] = target_cid
         return files, meta, "retarget"
     if full:
         return files, meta, "full"
     if not prev:
-        write_sync_baseline(files)
-        return [], load_sync_meta(), "baseline"
+        pull_cid = _pull_meta_character_id()
+        if target_cid and pull_cid and pull_cid == target_cid:
+            write_sync_baseline(files)
+            return [], load_sync_meta(), "baseline"
+        # 未拉取过（或 pull 不是当前卡）：空基线不能当成已同步
+        return files, {"version": 1, "character_id": target_cid, "files": {}}, "full"
     changed: list[Path] = []
     for path in files:
         rel = path.relative_to(ROOT).as_posix()
@@ -937,12 +1240,40 @@ def publish(cookie, token, character_id: int) -> None:
 
 def cmd_login(args):
     env = _read_env_map()
+    if getattr(args, "cookie", None):
+        fresh = login_with_cookie(args.cookie)
+        mail = ""
+        try:
+            mail = str((_session_from_cookie(fresh).get("user") or {}).get("email") or "")
+        except Exception:
+            pass
+        _save_env(cookie=fresh, email=mail or None)
+        _, _, remain, mail2 = load_auth(min_remain=0)
+        print(f"login ok (cookie) email={mail2 or mail} remain_s={remain}")
+        return
+    if getattr(args, "code_image", None):
+        path = Path(args.code_image)
+        if not path.is_file():
+            raise SystemExit(f"找不到登录码图片: {path}")
+        fresh = login_with_signin_code_image(path.read_bytes(), path.name)
+        mail = ""
+        try:
+            mail = str((_session_from_cookie(fresh).get("user") or {}).get("email") or "")
+        except Exception:
+            pass
+        _save_env(cookie=fresh, email=mail or None)
+        _, _, remain, mail2 = load_auth(min_remain=0)
+        print(f"login ok (登录码) email={mail2 or mail} remain_s={remain}")
+        return
     email = (args.email or env.get("email") or "").strip()
     password = args.password if args.password is not None else (env.get("password") or "")
     if not email or not password:
         raise SystemExit(
-            "用法: python tools/dzmm_studio.py login --email you@mail.com --password '***'\n"
-            "或先在 .env 写好 email= / password="
+            "用法:\n"
+            "  python lib/dzmm_studio.py login --email you@mail.com --password '***'\n"
+            "  python lib/dzmm_studio.py login --cookie 'sb-rls-auth-token=...'\n"
+            "  python lib/dzmm_studio.py login --code-image sign-in.png\n"
+            "或先在 .env 写好 email= / password=；Telegram 请在网页控制台登录。"
         )
     fresh = login_with_password(email, password)
     _save_env(cookie=fresh, email=email, password=password)
@@ -980,7 +1311,8 @@ def cmd_sync(args):
         print(f"sync: 已建立增量基线（{len((meta.get('files') or {}))} 个文件），本次不上传")
         print("提示：之后只传有改动的文件；若需全量请加 --full")
         return
-    if not to_upload:
+    git_pending = bool(meta.get("gitSavePending"))
+    if not to_upload and not git_pending:
         print("sync: 无变更文件，跳过上传")
         return
     if mode == "retarget":
@@ -988,10 +1320,12 @@ def cmd_sync(args):
             f"sync: 检测到目标卡 ID 变更，强制全量上传 "
             f"{len(to_upload)} 个文件 -> gameId={game_id}"
         )
-    else:
+    elif to_upload:
         print(f"sync {len(to_upload)}/{len(files)} changed -> container gameId={game_id} ({mode})")
+    elif git_pending:
+        print("sync: 无文件变更，补做上次未完成的 git save")
     ok = fail = 0
-    entries = dict(meta.get("files") or {})
+    entries = {} if mode in ("full", "retarget") else dict(meta.get("files") or {})
     for i, path in enumerate(to_upload, 1):
         rel = path.relative_to(ROOT).as_posix()
         try:
@@ -1002,17 +1336,32 @@ def cmd_sync(args):
                 print(f"  [{i}/{len(to_upload)}] {rel}")
         except Exception as e:
             fail += 1
+            entries.pop(rel, None)
             print(f"  FAIL {rel}: {e}")
-    meta["files"] = entries
-    meta["character_id"] = int(getattr(args, "character_id", 0) or DEFAULT_CARD_ID or 0)
-    save_sync_meta(meta)
-    print(f"uploaded ok={ok} fail={fail}")
-    if fail:
-        raise SystemExit(1)
+    if to_upload:
+        meta["files"] = entries
+        meta["character_id"] = int(getattr(args, "character_id", 0) or DEFAULT_CARD_ID or 0)
+        save_sync_meta(meta)
+        print(f"uploaded ok={ok} fail={fail}")
+        if fail:
+            raise SystemExit(1)
     if not args.no_git_save:
         print("git save…")
-        git_save(cookie, token, game_id, args.message)
-        print("git save done")
+        try:
+            git_save(cookie, token, game_id, args.message)
+            meta.pop("gitSavePending", None)
+            meta["character_id"] = int(getattr(args, "character_id", 0) or DEFAULT_CARD_ID or 0)
+            if to_upload:
+                meta["files"] = entries
+            save_sync_meta(meta)
+            print("git save done")
+        except Exception as e:
+            meta["gitSavePending"] = True
+            meta["character_id"] = int(getattr(args, "character_id", 0) or DEFAULT_CARD_ID or 0)
+            if to_upload:
+                meta["files"] = entries
+            save_sync_meta(meta)
+            raise SystemExit(f"git save 失败（已标记待重试）: {e}") from e
 
 
 def cmd_publish(args):
@@ -1085,9 +1434,11 @@ def main():
     def add_common(sp):
         sp.add_argument("--character-id", type=int, default=DEFAULT_CARD_ID or 0)
 
-    s = sub.add_parser("login", help="邮箱+密码登录，写入 .env cookie")
+    s = sub.add_parser("login", help="登录并写入 .env cookie（邮箱密码 / Cookie / 登录码图）")
     s.add_argument("--email")
     s.add_argument("--password")
+    s.add_argument("--cookie", help="粘贴 sb-rls-auth-token=… 或浏览器 Cookie")
+    s.add_argument("--code-image", help="官方登录码截图/二维码图片路径")
     s.set_defaults(func=cmd_login)
 
     s = sub.add_parser("status", help="检查登录态与远程容器")
