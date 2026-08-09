@@ -822,10 +822,16 @@ def write_sync_baseline(files: list[Path] | None = None) -> dict:
     return meta
 
 
-def select_files_to_sync(files: list[Path], *, full: bool = False) -> tuple[list[Path], dict, str]:
+def select_files_to_sync(
+    files: list[Path],
+    *,
+    full: bool = False,
+    character_id: int | None = None,
+) -> tuple[list[Path], dict, str]:
     """选出需要上传的文件。
 
     - full=True：全部上传
+    - character_id 与 `_sync_meta.json` 记录不一致：换卡/换目标容器，强制全量
     - 无基线：先写基线并返回空列表（假定刚拉取后本地=容器）
     - 有基线：只返回 size/mtime/sha256 变化的文件
     """
@@ -833,6 +839,15 @@ def select_files_to_sync(files: list[Path], *, full: bool = False) -> tuple[list
     files = list(files)
     meta = load_sync_meta()
     prev = dict(meta.get("files") or {})
+    target_cid = int(
+        character_id if character_id is not None else (DEFAULT_CARD_ID or 0)
+    )
+    meta_cid = int(meta.get("character_id") or 0)
+    # 换了官方卡 ID 后，本地哈希往往未变，但远端是空白容器，必须全量推
+    if target_cid and meta_cid and target_cid != meta_cid:
+        meta = dict(meta)
+        meta["character_id"] = target_cid
+        return files, meta, "retarget"
     if full:
         return files, meta, "full"
     if not prev:
@@ -958,7 +973,9 @@ def cmd_sync(args):
         only = {p.replace("\\", "/") for p in args.only}
         files = [f for f in files if f.relative_to(ROOT).as_posix() in only]
     full = bool(getattr(args, "full", False))
-    to_upload, meta, mode = select_files_to_sync(files, full=full)
+    to_upload, meta, mode = select_files_to_sync(
+        files, full=full, character_id=int(args.character_id or 0)
+    )
     if mode == "baseline":
         print(f"sync: 已建立增量基线（{len((meta.get('files') or {}))} 个文件），本次不上传")
         print("提示：之后只传有改动的文件；若需全量请加 --full")
@@ -966,7 +983,13 @@ def cmd_sync(args):
     if not to_upload:
         print("sync: 无变更文件，跳过上传")
         return
-    print(f"sync {len(to_upload)}/{len(files)} changed -> container gameId={game_id} ({mode})")
+    if mode == "retarget":
+        print(
+            f"sync: 检测到目标卡 ID 变更，强制全量上传 "
+            f"{len(to_upload)} 个文件 -> gameId={game_id}"
+        )
+    else:
+        print(f"sync {len(to_upload)}/{len(files)} changed -> container gameId={game_id} ({mode})")
     ok = fail = 0
     entries = dict(meta.get("files") or {})
     for i, path in enumerate(to_upload, 1):

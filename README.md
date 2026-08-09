@@ -140,7 +140,7 @@ Agent 入口：[`AGENTS.md`](AGENTS.md) → [`_模板/AGENTS.md`](_模板/AGENTS
 | 项目配置 | `character_id`（Workbench 地址栏）、本地项目路径（含 `publish/`）、预览端口（默认 `8791`） |
 | 拉取容器 | 云端整包落地；路径空则默认 `../{character_id}` |
 | 预览 | 启动时若已登录且本地有 `publish/` 会自动拉起；也可在网页里启停；全屏后用悬浮球：菜单 / 刷新 / **增量 sync** / **发布** |
-| 同步 | 对照 `_sync_meta.json` 增量上传；强制全量加 `--full` |
+| 同步 | 对照 `_sync_meta.json` 增量上传；**更换 `character_id` 会自动全量**；强制全量加 `--full` |
 
 ### 界面截图
 

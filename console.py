@@ -759,7 +759,9 @@ def _run_sync_job(cid: int, message: str, only, full: bool = False) -> None:
             )
             return
 
-        to_upload, meta, mode = studio.select_files_to_sync(files, full=bool(full))
+        to_upload, meta, mode = studio.select_files_to_sync(
+            files, full=bool(full), character_id=int(cid)
+        )
         if mode == "baseline":
             _sync_set(
                 running=False,
@@ -788,9 +790,12 @@ def _run_sync_job(cid: int, message: str, only, full: bool = False) -> None:
             return
 
         total = len(to_upload)
+        upload_label = "全量上传" if mode in ("full", "retarget") else "增量上传"
+        if mode == "retarget":
+            upload_label = "换卡全量上传"
         _sync_set(
             phase="upload",
-            message=f"增量上传 0/{total}（共扫描 {len(files)}）",
+            message=f"{upload_label} 0/{total}（共扫描 {len(files)}）",
             current=0,
             total=total,
         )
@@ -812,7 +817,7 @@ def _run_sync_job(cid: int, message: str, only, full: bool = False) -> None:
                 ok=ok,
                 fail=fail,
                 fails=list(fails),
-                message=f"增量上传 {i}/{total}" + (f"（失败 {fail}）" if fail else ""),
+                message=f"{upload_label} {i}/{total}" + (f"（失败 {fail}）" if fail else ""),
             )
 
         meta["files"] = entries
