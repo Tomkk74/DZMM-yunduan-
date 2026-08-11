@@ -6,6 +6,7 @@
   var bridgeTimer = null;
   var publishTimer = null;
   var SIDEBAR_KEY = 'dzmm-console-sidebar-collapsed';
+  var AGENT_KEY = 'dzmm-console-agent-collapsed';
   var CONSOLE_MODE_KEY = 'dzmm-console-mode';
   var CONSOLE_CARD_KEY = 'dzmm-console-card-id';
   var consoleMode = 'game'; // game | card
@@ -60,6 +61,9 @@
   };
   var CLOUD_PAGE_SIZE = 20;
   var cloudSearchTimer = null;
+  var previewSource = 'local';
+  var cloudPreviewTimer = null;
+  var cloudPreviewRevision = 0;
 
   function previewEmbedUrl(url) {
     if (!url) return '';
@@ -69,6 +73,135 @@
       return u.toString();
     } catch (_) {
       return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'embed=1';
+    }
+  }
+
+  function setPreviewSourceUi(source) {
+    previewSource = source === 'cloud' ? 'cloud' : 'local';
+    if ($('previewSrcLocal')) $('previewSrcLocal').classList.toggle('active', previewSource === 'local');
+    if ($('previewSrcCloud')) $('previewSrcCloud').classList.toggle('active', previewSource === 'cloud');
+    if ($('previewTitle')) $('previewTitle').textContent = previewSource === 'cloud' ? '云端预览' : '本地预览';
+  }
+
+  function stopCloudPreviewPoll() {
+    if (cloudPreviewTimer) {
+      clearInterval(cloudPreviewTimer);
+      cloudPreviewTimer = null;
+    }
+  }
+
+  var cloudPreviewLastReloadAt = 0;
+  var cloudPreviewReloadPending = false;
+
+  function previewBaseKey(url) {
+    if (!url) return '';
+    try {
+      var u = new URL(url, window.location.href);
+      u.searchParams.delete('_ts');
+      u.searchParams.delete('embed');
+      return u.origin + u.pathname;
+    } catch (_) {
+      return String(url).replace(/[?&](_ts|embed)=[^&]*/g, '').replace(/[?&]$/, '');
+    }
+  }
+
+  function reloadPreviewFrame(force) {
+    var frame = $('previewFrame');
+    if (!frame) return;
+    var base = frame.dataset.url || '';
+    if (!base || base === 'about:blank') return;
+    var now = Date.now();
+    // 避免云端轮询把整页刷爆（会打穿 static 代理限流 → 429）
+    if (!force && now - cloudPreviewLastReloadAt < 8000) return;
+    cloudPreviewLastReloadAt = now;
+    frame.src = base + (base.indexOf('?') >= 0 ? '&' : '?') + '_ts=' + now;
+  }
+
+  function startCloudPreviewPoll() {
+    stopCloudPreviewPoll();
+    if (previewSource !== 'cloud') return;
+    cloudPreviewTimer = setInterval(async function () {
+      if (previewSource !== 'cloud') return;
+      try {
+        var data = await api('/api/preview/source');
+        var cloud = data.cloud || (data.preview && data.preview.cloud) || {};
+        var rev = Number(cloud.revision || 0);
+        var meta = $('previewMeta');
+        var tip = cloud.message || '云端镜像中';
+        if (cloud.running) tip = '正在拉取云端…';
+        if (cloud.error) tip = cloud.error;
+        if (data.pending) tip = tip || '首次拉取中…';
+        if (meta) {
+          meta.textContent = '云端预览 · rev ' + rev + ' · ' + tip;
+        }
+        if (data.source) setPreviewSourceUi(data.source);
+        var frame = $('previewFrame');
+        var curKey = previewBaseKey(frame && frame.dataset.url);
+        var nextUrl = (data.preview && data.preview.url) || '';
+        var nextKey = previewBaseKey(nextUrl);
+        var actual = (data.preview && data.preview.source) || '';
+        // 仅在「尚未挂上云端预览」时启动一次，勿每轮 render（会带 _ts 整页重载）
+        if (data.preview && data.preview.running && actual === 'cloud' && nextKey && curKey !== nextKey) {
+          renderPreview(data.preview, { keepSourceUi: true });
+        } else if (data.preview && !data.preview.running && data.pending) {
+          renderPreview(data.preview, { keepSourceUi: true });
+        }
+        // 镜像有变更：拉取中只记标记，结束后再刷一次，避免整页连刷打穿限流
+        if (rev > cloudPreviewRevision) {
+          cloudPreviewRevision = rev;
+          if (cloud.running || data.pending) cloudPreviewReloadPending = true;
+          else if (curKey) {
+            cloudPreviewReloadPending = false;
+            reloadPreviewFrame(false);
+          }
+        } else if (cloudPreviewReloadPending && !cloud.running && !data.pending && curKey) {
+          cloudPreviewReloadPending = false;
+          reloadPreviewFrame(false);
+        }
+      } catch (_) {}
+    }, 4000);
+  }
+
+  async function switchPreviewSource(source) {
+    source = source === 'cloud' ? 'cloud' : 'local';
+    setBusy(true);
+    showMsg(source === 'cloud' ? '正在切换到云端预览…' : '正在切换到本地预览…', true);
+    try {
+      var data = await api('/api/preview/source', {
+        method: 'POST',
+        body: JSON.stringify({
+          source: source,
+          characterId: $('characterId') ? $('characterId').value : undefined,
+          projectPath: $('projectPath') ? $('projectPath').value.trim() : undefined,
+          previewPort: $('previewPort') ? $('previewPort').value : undefined,
+        }),
+      });
+      if (data.status) fillForm(data.status);
+      if (!data.ok) {
+        showMsg(data.error || '切换失败', false);
+        return;
+      }
+      setPreviewSourceUi(data.source || source);
+      cloudPreviewRevision = Number((data.cloud && data.cloud.revision) || 0);
+      if (data.preview) {
+        $('previewFrame').dataset.url = '';
+        renderPreview(data.preview);
+      }
+      if (previewSource === 'cloud') startCloudPreviewPoll();
+      else stopCloudPreviewPoll();
+      showMsg(
+        data.message ||
+          (data.pending
+            ? '正在首次拉取云端，完成后自动预览…'
+            : previewSource === 'cloud'
+              ? '已切到云端预览'
+              : '已切到本地预览'),
+        true
+      );
+    } catch (e) {
+      showMsg(String(e.message || e), false);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -90,7 +223,7 @@
   function setBusy(busy, opts) {
     opts = opts || {};
     var keep = opts.keepEnabled || {};
-    ['loginBtn', 'logoutBtn', 'logoutBtn2', 'logoutBtn3', 'logoutBtn4', 'loginCodeBtn', 'cookieLoginBtn', 'tgStartBtn', 'tgStopBtn', 'pingBtn', 'pullBtn', 'pullRetryBtn', 'previewStartBtn', 'previewStopBtn', 'previewReloadBtn', 'publishBtn', 'bridgeRefreshBtn', 'fabPublish', 'fabReload', 'fabSync', 'fabExpand', 'originProbeBtn', 'originSelect', 'cardAiBtn', 'cardCopyPromptBtn', 'cardNewBtn2', 'cardSaveBtn', 'cardExportPngBtn', 'cardRefreshBtn', 'cardCloudBtn', 'cardReloadBtn', 'cardMenuBtn', 'cardVoiceRefreshBtn', 'cardVoiceClearBtn', 'cardPublishBtn', 'cardDraftBtn', 'cardCloudFilterAll', 'cardCloudFilterDraft', 'cardCloudFilterPub', 'cardCloudSearch'].forEach(function (id) {
+    ['loginBtn', 'logoutBtn', 'logoutBtn2', 'logoutBtn3', 'logoutBtn4', 'loginCodeBtn', 'cookieLoginBtn', 'tgStartBtn', 'tgStopBtn', 'pingBtn', 'pullBtn', 'pullRetryBtn', 'previewStartBtn', 'previewStopBtn', 'previewReloadBtn', 'previewSrcLocal', 'previewSrcCloud', 'publishBtn', 'bridgeRefreshBtn', 'fabPublish', 'fabReload', 'fabSync', 'fabExpand', 'originProbeBtn', 'originSelect', 'agentReadyBtn', 'agentSendBtn', 'agentCancelBtn', 'agentToggleBtn', 'agentCollapseBtn', 'cardAiBtn', 'cardCopyPromptBtn', 'cardNewBtn2', 'cardSaveBtn', 'cardExportPngBtn', 'cardRefreshBtn', 'cardCloudBtn', 'cardReloadBtn', 'cardMenuBtn', 'cardVoiceRefreshBtn', 'cardVoiceClearBtn', 'cardPublishBtn', 'cardDraftBtn', 'cardCloudFilterAll', 'cardCloudFilterDraft', 'cardCloudFilterPub', 'cardCloudSearch'].forEach(function (id) {
       var el = $(id);
       if (!el) return;
       if (busy && keep[id]) {
@@ -227,9 +360,9 @@
     $('bridgeRemain').textContent = '登录态剩余约 ' + mins + ' 分钟（' + (remain || 0) + 's）';
   }
 
-  async function refreshBridge() {
+  async function refreshBridge(force) {
     try {
-      var data = await api('/api/bridge');
+      var data = await api(force ? '/api/bridge?force=1' : '/api/bridge');
       renderBridge(data.bridge, data.preview || {});
       return data;
     } catch (e) {
@@ -343,20 +476,33 @@
     else wrap.classList.remove('is-live');
   }
 
-  function renderPreview(preview) {
+  function renderPreview(preview, opts) {
+    opts = opts || {};
     var meta = $('previewMeta');
     var link = $('previewLink');
     var frame = $('previewFrame');
+    if (!opts.keepSourceUi && preview && (preview.desiredSource || preview.source)) {
+      setPreviewSourceUi(preview.desiredSource || preview.source);
+    }
     if (!preview) {
       meta.textContent = '预览未启动';
       link.href = '#';
       setStageLive(false);
+      if (previewSource !== 'cloud') stopCloudPreviewPoll();
       return;
     }
     var url = preview.url || '';
     var alive = !!(preview.running && url);
+    var actual = preview.source || 'local';
+    var srcLabel = actual === 'cloud' ? '云端' : '本地';
     if (alive) {
-      meta.textContent = '预览中 · ' + url + (preview.projectPath ? ' · ' + preview.projectPath : '');
+      var cloud = preview.cloud || {};
+      var extra = preview.projectPath ? ' · ' + preview.projectPath : '';
+      if (actual === 'cloud') {
+        extra = ' · rev ' + (cloud.revision || cloudPreviewRevision || 0) +
+          (cloud.message ? ' · ' + cloud.message : '');
+      }
+      meta.textContent = srcLabel + '预览中 · ' + url + extra;
       link.href = url;
       setStageLive(true);
       var embed = previewEmbedUrl(url);
@@ -365,12 +511,21 @@
         frame.src = embed + (embed.indexOf('?') >= 0 ? '&' : '?') + '_ts=' + Date.now();
       }
       startBridgePoll();
+      if (previewSource === 'cloud' || actual === 'cloud') startCloudPreviewPoll();
+      else stopCloudPreviewPoll();
     } else {
-      meta.textContent = preview.message || preview.error || '预览未启动';
+      var cloud2 = preview.cloud || {};
+      if (previewSource === 'cloud') {
+        meta.textContent = cloud2.message || preview.message || preview.error || '正在拉取云端…';
+        startCloudPreviewPoll();
+      } else {
+        meta.textContent = preview.message || preview.error || '预览未启动';
+      }
       link.href = url || '#';
       if (!preview.running) {
         setStageLive(false);
         stopBridgePoll();
+        if (previewSource !== 'cloud') stopCloudPreviewPoll();
         renderBridge(null, preview);
       }
       if (preview.error) {
@@ -378,6 +533,7 @@
         frame.src = 'about:blank';
         setStageLive(false);
         stopBridgePoll();
+        stopCloudPreviewPoll();
       }
     }
   }
@@ -447,6 +603,7 @@
     });
     var sidebar = $('sidebar');
     if (sidebar) sidebar.classList.toggle('is-card-console', mode === 'card');
+    if ($('agentToggleBtn')) $('agentToggleBtn').hidden = mode === 'card';
 
     if (opts.skipPanel) return;
 
@@ -1777,7 +1934,9 @@
     }
   }
 
-  function fillForm(status) {
+  function fillForm(status, opts) {
+    opts = opts || {};
+    if (!status) return;
     if (status.email && !$('email').value) $('email').value = status.email;
     if (status.characterId) $('characterId').value = status.characterId;
     if (status.projectPath) $('projectPath').value = status.projectPath;
@@ -1835,7 +1994,7 @@
       error: status.error || '',
     }, null, 2);
     if (status.pull) renderPull(status.pull);
-    if (status.preview) renderPreview(status.preview);
+    if (!opts.skipPreview && status.preview) renderPreview(status.preview);
   }
 
   async function api(path, options) {
@@ -2013,6 +2172,8 @@
       if (data.ok) {
         showMsg('登录成功 · 剩余约 ' + data.remainSec + 's', true);
         $('password').value = '';
+        if (data.bridge) renderBridge(data.bridge, data.preview || {});
+        else refreshBridge(true);
       } else {
         showMsg(data.error || '登录失败', false);
       }
@@ -2051,6 +2212,8 @@
         if (data.ok) {
           showMsg('登录码登录成功 · 剩余约 ' + data.remainSec + 's', true);
           if (input) input.value = '';
+          if (data.bridge) renderBridge(data.bridge, data.preview || {});
+          else refreshBridge(true);
         } else {
           showMsg(data.error || '登录码登录失败', false);
         }
@@ -2082,6 +2245,8 @@
         if (data.ok) {
           showMsg('Cookie 登录成功 · 剩余约 ' + data.remainSec + 's', true);
           if ($('cookieInput')) $('cookieInput').value = '';
+          if (data.bridge) renderBridge(data.bridge, data.preview || {});
+          else refreshBridge(true);
         } else {
           showMsg(data.error || 'Cookie 登录失败', false);
         }
@@ -2145,6 +2310,8 @@
               stopTelegramPoll();
               showMsg('Telegram 登录成功 · 剩余约 ' + poll.remainSec + 's', true);
               if ($('tgStatus')) $('tgStatus').textContent = '已登录';
+              if (poll.bridge) renderBridge(poll.bridge, poll.preview || {});
+              else refreshBridge(true);
               return;
             }
             if ($('tgStatus')) {
@@ -2210,7 +2377,12 @@
       if (data.ok) {
         showMsg('编辑器已连接 · gameId=' + data.gameId + ' · ' + (data.editorStatus || ''), true);
       } else {
-        showMsg(data.error || '连接失败', false);
+        if (data.captchaUrl) {
+          try { window.open(data.captchaUrl, '_blank', 'noopener'); } catch (_) {}
+          showMsg((data.error || '需要验证码') + ' · 已尝试打开验证页', false);
+        } else {
+          showMsg(data.error || '连接失败', false);
+        }
       }
     } catch (e) {
       showMsg(String(e.message || e), false);
@@ -2221,7 +2393,7 @@
 
   $('previewStartBtn').addEventListener('click', async function () {
     setBusy(true);
-    showMsg('正在启动本地预览…', true);
+    showMsg(previewSource === 'cloud' ? '正在启动云端预览…' : '正在启动本地预览…', true);
     try {
       await api('/api/config', {
         method: 'POST',
@@ -2232,25 +2404,47 @@
           previewPort: $('previewPort').value,
         }),
       });
-      var data = await api('/api/preview/start', {
-        method: 'POST',
-        body: JSON.stringify({
-          characterId: $('characterId').value,
-          projectPath: $('projectPath').value.trim(),
-          previewPort: $('previewPort').value,
-        }),
-      });
+      var data;
+      if (previewSource === 'cloud') {
+        data = await api('/api/preview/source', {
+          method: 'POST',
+          body: JSON.stringify({
+            source: 'cloud',
+            characterId: $('characterId').value,
+            projectPath: $('projectPath').value.trim(),
+            previewPort: $('previewPort').value,
+          }),
+        });
+      } else {
+        data = await api('/api/preview/start', {
+          method: 'POST',
+          body: JSON.stringify({
+            characterId: $('characterId').value,
+            projectPath: $('projectPath').value.trim(),
+            previewPort: $('previewPort').value,
+            source: 'local',
+          }),
+        });
+      }
       if (data.status) fillForm(data.status);
       else if (data.preview) renderPreview(data.preview);
       if (data.ok) {
+        setPreviewSourceUi(data.source || previewSource);
+        cloudPreviewRevision = Number((data.cloud && data.cloud.revision) || cloudPreviewRevision || 0);
         var url = data.url || (data.preview && data.preview.url) || '';
-        showMsg('预览已启动 · ' + url, true);
+        showMsg((previewSource === 'cloud' ? '云端' : '本地') + '预览已启动 · ' + url, true);
         if (url) {
           $('previewLink').href = url;
           $('previewFrame').dataset.url = '';
-          renderPreview(Object.assign({}, data.preview || {}, { running: true, url: url }));
+          renderPreview(Object.assign({}, data.preview || {}, {
+            running: true,
+            url: url,
+            source: previewSource,
+            cloud: data.cloud || (data.preview && data.preview.cloud) || {},
+          }));
           switchPanel('bridge');
           startBridgePoll();
+          if (previewSource === 'cloud') startCloudPreviewPoll();
         }
       } else {
         var errText = data.error || '预览启动失败';
@@ -2280,6 +2474,8 @@
       $('previewFrame').dataset.url = '';
       setStageLive(false);
       stopBridgePoll();
+      stopCloudPreviewPoll();
+      setPreviewSourceUi('local');
       renderBridge(null, { running: false });
       showMsg('预览已停止', true);
     } catch (e) {
@@ -2289,12 +2485,29 @@
     }
   });
 
+  if ($('previewSrcLocal')) {
+    $('previewSrcLocal').addEventListener('click', function () {
+      if (previewSource === 'local') return;
+      switchPreviewSource('local');
+    });
+  }
+  if ($('previewSrcCloud')) {
+    $('previewSrcCloud').addEventListener('click', function () {
+      if (previewSource === 'cloud') return;
+      switchPreviewSource('cloud');
+    });
+  }
+
   $('bridgeRefreshBtn').addEventListener('click', async function () {
     setBusy(true);
     try {
-      var data = await refreshBridge();
-      if (data && data.ok) showMsg('桥接状态已刷新', true);
-      else showMsg((data && data.error) || '预览未启动', false);
+      var data = await refreshBridge(true);
+      if (data && data.ok) {
+        var name = (data.bridge && (data.bridge.displayName || data.bridge.email)) || '';
+        showMsg(name ? ('桥接已刷新 · 链接用户 ' + name) : '桥接状态已刷新', true);
+      } else {
+        showMsg((data && data.error) || '预览未启动', false);
+      }
     } finally {
       setBusy(false);
     }
@@ -4173,11 +4386,627 @@
     });
   }
 
+  /* —— 右侧官方 Workbench Agent —— */
+  var agentState = {
+    sessionId: '',
+    backend: '',
+    taskId: '',
+    since: 0,
+    polling: false,
+    pollTimer: null,
+    pollFails: 0,
+    gameId: '',
+    streamingEl: null,
+    reasoningEl: null,
+    toolOutputEl: null,
+    streamedIds: {},
+    seenToolKeys: {},
+    hadAssistantText: false,
+    hadToolActivity: false,
+    autoContinueCount: 0,
+    maxAutoContinue: 2,
+    userStopped: false,
+  };
+
+  function resetAgentSession(reason) {
+    agentState.sessionId = '';
+    if (reason) setAgentHint(reason, true);
+  }
+
+  function maybeAutoContinue(reason) {
+    if (agentState.userStopped) return false;
+    if (agentState.polling) return false;
+    if ((agentState.autoContinueCount || 0) >= (agentState.maxAutoContinue || 2)) return false;
+    if (!agentState.sessionId) return false;
+    agentState.autoContinueCount = (agentState.autoContinueCount || 0) + 1;
+    var n = agentState.autoContinueCount;
+    var max = agentState.maxAutoContinue || 2;
+    appendAgentBubble('status', '检测到中断/无总结，自动发送「继续」（' + n + '/' + max + '）' + (reason ? ' · ' + reason : ''), {
+      label: 'auto',
+      collapse: false,
+    });
+    setAgentHint('自动续跑中…', true);
+    setTimeout(function () {
+      sendOfficialAgent({ text: '继续', retry: true, autoContinue: true });
+    }, 450);
+    return true;
+  }
+
+  function setAgentCollapsed(collapsed) {
+    var app = $('appShell');
+    if (!app) return;
+    app.classList.toggle('is-agent-collapsed', !!collapsed);
+    try { localStorage.setItem(AGENT_KEY, collapsed ? '1' : '0'); } catch (_) {}
+  }
+
+  function agentBackend() {
+    return (($('agentBackend') && $('agentBackend').value) || 'claude').toLowerCase();
+  }
+
+  function setAgentHint(text, ok) {
+    var el = $('agentHint');
+    if (!el) return;
+    el.textContent = text || '';
+    el.classList.toggle('err', ok === false);
+  }
+
+  function clearAgentWelcome() {
+    var box = $('agentMsgs');
+    if (!box) return;
+    var welcome = box.querySelector('.agent-welcome');
+    if (welcome) welcome.remove();
+  }
+
+  var AGENT_FOLD_LINES = 8;
+  var AGENT_FOLD_CHARS = 420;
+  var AGENT_TOOL_OUT_MAX = 900;
+
+  function agentShouldFold(role, text, opts) {
+    opts = opts || {};
+    if (opts.collapse === false) return false;
+    if (opts.forceFold || opts.collapse === true) return true;
+    if (role === 'tool' || role === 'reasoning') return true;
+    if (opts.label === 'shell-out') return true;
+    var t = text || '';
+    // 单行超长 bash 也要折叠
+    if (t.length > 120 && (role === 'tool' || /bash|shell|sed |rg |find |node /.test(t))) return true;
+    if (t.split('\n').length > AGENT_FOLD_LINES) return true;
+    if (t.length > AGENT_FOLD_CHARS) return true;
+    if (/```/.test(t)) return true;
+    return false;
+  }
+
+  function agentFoldSummary(role, text, opts) {
+    opts = opts || {};
+    var t = text || '';
+    var lines = t ? t.split('\n').length : 0;
+    if (role === 'tool' || opts.label === 'tool▶' || opts.label === 'tool') {
+      var head = (opts.summary || t.split('\n')[0] || 'command').trim();
+      if (head.length > 70) head = head.slice(0, 70) + '…';
+      return (opts.label || 'tool') + ' · ' + head;
+    }
+    if (opts.label === 'shell-out' || role === 'tool_output') {
+      return 'shell-out · ' + lines + ' 行 / ' + t.length + ' 字（点击展开）';
+    }
+    if (role === 'reasoning') {
+      var tip = t.replace(/\s+/g, ' ').trim().slice(0, 48);
+      return 'thinking' + (tip ? ' · ' + tip + (t.length > 48 ? '…' : '') : '');
+    }
+    return '长输出 · ' + lines + ' 行（点击展开）';
+  }
+
+  function updateAgentFoldSummary(ref) {
+    if (!ref || !ref.summaryEl) return;
+    var role = ref.role || 'assistant';
+    var text = (ref.body && ref.body.textContent) || '';
+    ref.summaryEl.textContent = agentFoldSummary(role, text, ref.opts || {});
+  }
+
+  function appendAgentBubble(role, text, opts) {
+    opts = opts || {};
+    clearAgentWelcome();
+    var box = $('agentMsgs');
+    if (!box) return null;
+    var div = document.createElement('div');
+    div.className = 'agent-bubble ' + (role || 'assistant');
+    var label = document.createElement('span');
+    label.className = 'agent-role';
+    label.textContent = opts.label || role || 'assistant';
+    div.appendChild(label);
+
+    var fullText = text || '';
+    if (opts.detail && opts.detail !== fullText) {
+      fullText = fullText ? (fullText + '\n\n' + opts.detail) : opts.detail;
+    }
+    var fold = opts.collapse !== false && agentShouldFold(role, fullText, opts);
+    var body;
+    var summaryEl = null;
+    var detailsEl = null;
+    if (fold) {
+      detailsEl = document.createElement('details');
+      detailsEl.className = 'agent-fold';
+      detailsEl.open = !!opts.open;
+      summaryEl = document.createElement('summary');
+      summaryEl.className = 'agent-fold-summary';
+      summaryEl.textContent = agentFoldSummary(role, fullText, opts);
+      body = document.createElement('pre');
+      body.className = 'agent-body agent-fold-body';
+      body.textContent = fullText;
+      detailsEl.appendChild(summaryEl);
+      detailsEl.appendChild(body);
+      div.appendChild(detailsEl);
+    } else {
+      body = document.createElement('div');
+      body.className = 'agent-body';
+      body.textContent = fullText;
+      div.appendChild(body);
+    }
+    box.appendChild(div);
+    box.scrollTop = box.scrollHeight;
+    return {
+      root: div,
+      body: body,
+      detailsEl: detailsEl,
+      summaryEl: summaryEl,
+      role: role,
+      opts: opts,
+      truncated: false,
+    };
+  }
+
+  function appendAgentTextDelta(text) {
+    if (!text) return;
+    agentState.reasoningEl = null;
+    agentState.toolOutputEl = null;
+    if (!agentState.streamingEl) {
+      agentState.streamingEl = appendAgentBubble('assistant', '', { label: 'assistant', open: true });
+    }
+    if (!agentState.streamingEl) return;
+    agentState.streamingEl.body.textContent += text;
+    // 助手长文/代码块达到阈值后自动改成折叠（保持展开，不打断阅读）
+    if (!agentState.streamingEl.detailsEl && agentShouldFold('assistant', agentState.streamingEl.body.textContent, {})) {
+      var cur = agentState.streamingEl.body.textContent;
+      var parent = agentState.streamingEl.root;
+      var oldBody = agentState.streamingEl.body;
+      var detailsEl = document.createElement('details');
+      detailsEl.className = 'agent-fold';
+      detailsEl.open = true;
+      var summaryEl = document.createElement('summary');
+      summaryEl.className = 'agent-fold-summary';
+      var body = document.createElement('pre');
+      body.className = 'agent-body agent-fold-body';
+      body.textContent = cur;
+      detailsEl.appendChild(summaryEl);
+      detailsEl.appendChild(body);
+      parent.replaceChild(detailsEl, oldBody);
+      agentState.streamingEl.body = body;
+      agentState.streamingEl.detailsEl = detailsEl;
+      agentState.streamingEl.summaryEl = summaryEl;
+      agentState.streamingEl.role = 'assistant';
+    }
+    updateAgentFoldSummary(agentState.streamingEl);
+    var box = $('agentMsgs');
+    if (box) box.scrollTop = box.scrollHeight;
+  }
+
+  function appendAgentReasoningDelta(text) {
+    if (!text) return;
+    agentState.streamingEl = null;
+    agentState.toolOutputEl = null;
+    if (!agentState.reasoningEl) {
+      agentState.reasoningEl = appendAgentBubble('reasoning', '', { label: 'thinking', forceFold: true, open: false });
+    }
+    if (!agentState.reasoningEl) return;
+    agentState.reasoningEl.body.textContent += text;
+    updateAgentFoldSummary(agentState.reasoningEl);
+    var box = $('agentMsgs');
+    if (box) box.scrollTop = box.scrollHeight;
+  }
+
+  function appendAgentToolOutputDelta(text) {
+    if (!text) return;
+    agentState.streamingEl = null;
+    agentState.reasoningEl = null;
+    if (!agentState.toolOutputEl) {
+      agentState.toolOutputEl = appendAgentBubble('tool', '', {
+        label: 'shell-out',
+        forceFold: true,
+        open: false,
+      });
+    }
+    if (!agentState.toolOutputEl) return;
+    var body = agentState.toolOutputEl.body;
+    var cur = body.textContent || '';
+    if (agentState.toolOutputEl.truncated || cur.length >= AGENT_TOOL_OUT_MAX) {
+      if (!agentState.toolOutputEl.truncated) {
+        body.textContent = cur.slice(0, AGENT_TOOL_OUT_MAX) + '\n…(输出过长已截断，完整内容在容器内)';
+        agentState.toolOutputEl.truncated = true;
+        updateAgentFoldSummary(agentState.toolOutputEl);
+      }
+      return;
+    }
+    var next = cur + text;
+    if (next.length > AGENT_TOOL_OUT_MAX) {
+      body.textContent = next.slice(0, AGENT_TOOL_OUT_MAX) + '\n…(输出过长已截断，完整内容在容器内)';
+      agentState.toolOutputEl.truncated = true;
+    } else {
+      body.textContent = next;
+    }
+    updateAgentFoldSummary(agentState.toolOutputEl);
+    var box = $('agentMsgs');
+    if (box) box.scrollTop = box.scrollHeight;
+  }
+
+  function stopAgentPoll() {
+    agentState.polling = false;
+    if (agentState.pollTimer) {
+      clearTimeout(agentState.pollTimer);
+      agentState.pollTimer = null;
+    }
+    if ($('agentCancelBtn')) $('agentCancelBtn').disabled = true;
+    if ($('agentSendBtn')) $('agentSendBtn').disabled = false;
+  }
+
+  async function connectOfficialAgent() {
+    setAgentHint('正在连接官方容器…', true);
+    try {
+      var data = await api('/api/agent/ready', { method: 'POST', body: '{}' });
+      if (data.status) fillForm(data.status);
+      if (!data.ok) {
+        setAgentHint(data.error || '连接失败', false);
+        if ($('agentMeta')) $('agentMeta').textContent = '未连接';
+        return false;
+      }
+      agentState.gameId = data.gameId || '';
+      if ($('agentMeta')) {
+        $('agentMeta').textContent =
+          'gameId=' + (data.gameId || '—') +
+          (data.editorStatus ? ' · ' + data.editorStatus : '') +
+          (data.ttlSeconds ? ' · ttl ' + data.ttlSeconds + 's' : '');
+      }
+      setAgentHint('已连接官方 Agent（' + agentBackend() + '）', true);
+      return true;
+    } catch (e) {
+      setAgentHint(String(e.message || e), false);
+      return false;
+    }
+  }
+
+  function agentElapsedHint(extra) {
+    var started = agentState.pollStartedAt || Date.now();
+    var sec = Math.max(0, Math.round((Date.now() - started) / 1000));
+    var base = '官方助手执行中… ' + sec + 's';
+    return extra ? (base + ' · ' + extra) : base;
+  }
+
+  async function pollOfficialAgent() {
+    if (!agentState.polling || !agentState.taskId) return;
+    try {
+      var data = await api('/api/agent/poll', {
+        method: 'POST',
+        body: JSON.stringify({
+          taskId: agentState.taskId,
+          backend: agentBackend(),
+          since: agentState.since || 0,
+          gameId: agentState.gameId || '',
+        }),
+      });
+      // 轮询时不要 fillForm→renderPreview，否则预览/布局会被反复挤动
+      if (!data.ok) {
+        agentState.pollFails = (agentState.pollFails || 0) + 1;
+        if (agentState.pollFails < 20) {
+          setAgentHint(agentElapsedHint('轮询重试 ' + agentState.pollFails), true);
+          agentState.pollTimer = setTimeout(pollOfficialAgent, Math.min(2000, 600 + agentState.pollFails * 100));
+          return;
+        }
+        setAgentHint(data.error || '轮询失败', false);
+        stopAgentPoll();
+        return;
+      }
+      agentState.pollFails = 0;
+      agentState.since = data.since || agentState.since;
+      if (data.gameId) agentState.gameId = data.gameId;
+      // 只用事件里的 conversation session 续聊
+      if (data.sessionId) {
+        agentState.sessionId = data.sessionId;
+        if ($('agentMeta')) {
+          $('agentMeta').textContent =
+            'gameId=' + (agentState.gameId || '—') +
+            ' · session ' + String(agentState.sessionId).slice(0, 8) + '…';
+        }
+      }
+      var deltas = data.deltas || [];
+      var sessionLost = false;
+      for (var i = 0; i < deltas.length; i++) {
+        var d = deltas[i];
+        if (!d) continue;
+        var itemId = d.itemId ? String(d.itemId) : '';
+        if (d.kind === 'text') {
+          if (itemId && d.stream) agentState.streamedIds[itemId] = true;
+          // 已流式输出过的整段 full 消息跳过，避免只在结束时再刷一整坨
+          if (d.full && itemId && agentState.streamedIds[itemId] && !d.replace) continue;
+          if (d.full && !d.stream && agentState.streamingEl && !d.replace) {
+            // 无 itemId 的完整消息：若已有流式气泡则跳过
+            if ((agentState.streamingEl.body.textContent || '').length > 0) continue;
+          }
+          if (d.replace) {
+            agentState.streamingEl = null;
+            agentState.reasoningEl = null;
+            agentState.toolOutputEl = null;
+            appendAgentBubble('assistant', d.text || '', { label: 'assistant', open: true });
+          } else {
+            appendAgentTextDelta(d.text || '');
+          }
+          if (d.text) agentState.hadAssistantText = true;
+        } else if (d.kind === 'tool') {
+          var toolKey = (itemId || '') + '|' + (d.tool || '') + '|' + String(d.text || '').slice(0, 100);
+          if (toolKey && agentState.seenToolKeys[toolKey]) continue;
+          if (toolKey) agentState.seenToolKeys[toolKey] = true;
+          agentState.hadToolActivity = true;
+          agentState.streamingEl = null;
+          agentState.reasoningEl = null;
+          agentState.toolOutputEl = null;
+          var toolBody = d.text || d.tool || 'tool';
+          if (d.tool && d.text && d.text !== d.tool) toolBody = d.tool + ': ' + d.text;
+          else if (d.tool && !d.text) toolBody = d.tool;
+          appendAgentBubble(toolBody.indexOf('\n') >= 0 || (d.detail) ? 'tool' : 'tool', toolBody, {
+            label: d.status === 'running' ? 'tool▶' : 'tool',
+            detail: d.detail || '',
+            summary: (d.tool || 'tool') + (d.text && d.text !== d.tool ? (': ' + String(d.text).split('\n')[0]) : ''),
+            forceFold: true,
+            open: false,
+          });
+          setAgentHint(agentElapsedHint('调用 ' + (d.tool || 'tool')), true);
+        } else if (d.kind === 'tool_output') {
+          agentState.hadToolActivity = true;
+          var outText = d.text || '';
+          var outLines = outText ? outText.split('\n').length : 0;
+          if (d.detail || outLines > 6 || outText.length > 240) {
+            agentState.streamingEl = null;
+            agentState.reasoningEl = null;
+            agentState.toolOutputEl = null;
+            appendAgentBubble('tool', outText, {
+              label: 'shell-out',
+              detail: d.detail || '',
+              forceFold: true,
+              open: false,
+            });
+          } else {
+            appendAgentToolOutputDelta(outText);
+          }
+          setAgentHint(agentElapsedHint('工具返回'), true);
+        } else if (d.kind === 'reasoning') {
+          if (d.stream) appendAgentReasoningDelta(d.text || '');
+          else {
+            agentState.streamingEl = null;
+            agentState.reasoningEl = null;
+            agentState.toolOutputEl = null;
+            appendAgentBubble('reasoning', d.text || '', { label: 'thinking', forceFold: true, open: false });
+          }
+        } else if (d.kind === 'status') {
+          agentState.streamingEl = null;
+          agentState.reasoningEl = null;
+          agentState.toolOutputEl = null;
+          var stText = d.text || '';
+          if (/No conversation found|session ID/i.test(stText)) {
+            sessionLost = true;
+            appendAgentBubble('status', '会话已失效，已清空；请再发一条（会开新对话）', { label: 'error' });
+          } else if (String(d.status || '') === 'info') {
+            appendAgentBubble('status', stText, { label: 'info' });
+          } else {
+            appendAgentBubble('status', stText, { label: d.status || 'status' });
+          }
+        }
+      }
+      if (sessionLost) resetAgentSession();
+      if (data.done) {
+        var taskStatus = data.taskStatus || '';
+        if (typeof taskStatus !== 'string') {
+          try { taskStatus = JSON.stringify(taskStatus); } catch (_) { taskStatus = String(taskStatus); }
+        }
+        agentState.streamingEl = null;
+        agentState.reasoningEl = null;
+        agentState.toolOutputEl = null;
+        var okDone = !sessionLost && taskStatus === 'completed';
+        var failed = /^(failed|error|cancelled)$/i.test(taskStatus);
+        var needContinue =
+          !sessionLost &&
+          !agentState.userStopped &&
+          (
+            (okDone && !agentState.hadAssistantText && agentState.hadToolActivity) ||
+            failed
+          );
+        stopAgentPoll();
+        if (needContinue && maybeAutoContinue(okDone ? '无文字总结' : ('状态 ' + taskStatus))) {
+          return;
+        }
+        if (okDone && !agentState.hadAssistantText) {
+          appendAgentBubble('status', '本轮结束，但未收到文字总结。可手动发「继续」或「给出结论摘要」。', { label: 'info' });
+        }
+        setAgentHint(
+          sessionLost
+            ? '会话失效，已重置，请重新发送'
+            : (okDone ? '本轮完成' : ('任务结束：' + (taskStatus || 'done'))),
+          okDone
+        );
+        return;
+      }
+      if (!(deltas && deltas.length)) {
+        setAgentHint(agentElapsedHint('等待模型/工具…'), true);
+      } else if (!data.done) {
+        setAgentHint(agentElapsedHint(), true);
+      }
+    } catch (e) {
+      // 长任务期间偶发断连：不要停死，继续轮询
+      agentState.pollFails = (agentState.pollFails || 0) + 1;
+      if (agentState.polling && agentState.pollFails < 20) {
+        setAgentHint(agentElapsedHint('网络抖动 ' + agentState.pollFails), true);
+        agentState.pollTimer = setTimeout(pollOfficialAgent, Math.min(2500, 800 + agentState.pollFails * 120));
+        return;
+      }
+      setAgentHint(String(e.message || e), false);
+      stopAgentPoll();
+      // 轮询彻底失败时自动续跑
+      if (!agentState.userStopped && agentState.sessionId) {
+        maybeAutoContinue('轮询中断');
+      }
+      return;
+    }
+    agentState.pollTimer = setTimeout(pollOfficialAgent, 700);
+  }
+
+  async function sendOfficialAgent(opts) {
+    opts = opts || {};
+    var text = opts.text || (($('agentInput') && $('agentInput').value.trim()) || '');
+    if (!text) {
+      setAgentHint('请输入内容', false);
+      return;
+    }
+    if (agentState.polling) {
+      setAgentHint('上一轮仍在执行，可先点停止', false);
+      return;
+    }
+    var be = agentBackend();
+    if (agentState.backend && agentState.backend !== be) {
+      resetAgentSession('已切换后端，新开对话');
+    }
+    agentState.backend = be;
+    agentState.userStopped = false;
+    if (!opts.retry && !opts.autoContinue) {
+      appendAgentBubble('user', text, { label: 'you' });
+      if ($('agentInput')) $('agentInput').value = '';
+      agentState.autoContinueCount = 0;
+    } else if (opts.autoContinue) {
+      var autoBubble = appendAgentBubble('user', text, { label: 'auto·继续', collapse: false });
+      if (autoBubble && autoBubble.root) autoBubble.root.classList.add('is-auto');
+    }
+    agentState.streamingEl = null;
+    agentState.reasoningEl = null;
+    agentState.toolOutputEl = null;
+    agentState.streamedIds = {};
+    agentState.seenToolKeys = {};
+    agentState.hadAssistantText = false;
+    agentState.hadToolActivity = false;
+    if ($('agentSendBtn')) $('agentSendBtn').disabled = true;
+    setAgentHint(
+      opts.autoContinue
+        ? '自动续跑：继续…'
+        : (opts.retry ? '会话失效，正在新开对话重试…' : '提交中…'),
+      true
+    );
+    try {
+      var data = await api('/api/agent/send', {
+        method: 'POST',
+        body: JSON.stringify({
+          prompt: text,
+          backend: be,
+          // 仅传事件里拿到的 conversation session；空则新开
+          sessionId: opts.forceNew ? '' : (agentState.sessionId || ''),
+        }),
+      });
+      if (data.status) fillForm(data.status, { skipPreview: true });
+      if (!data.ok) {
+        var err = data.error || '发送失败';
+        if (!opts.retry && /No conversation found|session ID/i.test(err)) {
+          resetAgentSession();
+          return sendOfficialAgent({ text: text, retry: true, forceNew: true });
+        }
+        setAgentHint(err, false);
+        if ($('agentSendBtn')) $('agentSendBtn').disabled = false;
+        return;
+      }
+      agentState.taskId = data.taskId || '';
+      // 发送响应里的 sessionId 不可靠；等 poll 事件回填
+      agentState.gameId = data.gameId || agentState.gameId;
+      agentState.since = 0;
+      agentState.polling = true;
+      agentState.pollFails = 0;
+      agentState.pollStartedAt = Date.now();
+      if ($('agentCancelBtn')) $('agentCancelBtn').disabled = false;
+      if ($('agentMeta')) {
+        $('agentMeta').textContent =
+          'gameId=' + (agentState.gameId || '—') +
+          (agentState.sessionId ? ' · session ' + String(agentState.sessionId).slice(0, 8) + '…' : ' · 等待会话…');
+      }
+      setAgentHint('官方助手执行中…', true);
+      pollOfficialAgent();
+    } catch (e) {
+      setAgentHint(String(e.message || e), false);
+      if ($('agentSendBtn')) $('agentSendBtn').disabled = false;
+    }
+  }
+
+  if ($('agentCollapseBtn')) {
+    $('agentCollapseBtn').addEventListener('click', function () {
+      setAgentCollapsed(true);
+    });
+  }
+  if ($('agentToggleBtn')) {
+    $('agentToggleBtn').addEventListener('click', function () {
+      var app = $('appShell');
+      var collapsed = !!(app && app.classList.contains('is-agent-collapsed'));
+      setAgentCollapsed(!collapsed);
+      if (!collapsed) return;
+      // 展开时若尚未连接，尝试一次
+      if (!agentState.gameId) connectOfficialAgent();
+    });
+  }
+  if ($('agentReadyBtn')) {
+    $('agentReadyBtn').addEventListener('click', function () {
+      connectOfficialAgent();
+    });
+  }
+  if ($('agentSendBtn')) {
+    $('agentSendBtn').addEventListener('click', function () {
+      sendOfficialAgent();
+    });
+  }
+  if ($('agentCancelBtn')) {
+    $('agentCancelBtn').addEventListener('click', async function () {
+      var tid = agentState.taskId;
+      agentState.userStopped = true; // 手动停止后不再自动「继续」
+      stopAgentPoll();
+      agentState.streamingEl = null;
+      if (!tid) {
+        setAgentHint('已停止等待', true);
+        return;
+      }
+      try {
+        await api('/api/agent/cancel', {
+          method: 'POST',
+          body: JSON.stringify({ taskId: tid, backend: agentBackend() }),
+        });
+      } catch (_) {}
+      setAgentHint('已请求停止（不会自动续跑）', true);
+    });
+  }
+  if ($('agentInput')) {
+    $('agentInput').addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {
+        ev.preventDefault();
+        sendOfficialAgent();
+      }
+    });
+  }
+  if ($('agentBackend')) {
+    $('agentBackend').addEventListener('change', function () {
+      agentState.backend = agentBackend();
+      resetAgentSession('已切换 ' + agentState.backend + '，下一轮将新开会话');
+    });
+  }
+
   try {
     if (localStorage.getItem(SIDEBAR_KEY) === '1') setSidebarCollapsed(true);
     else setSidebarCollapsed(false);
   } catch (_) {
     setSidebarCollapsed(false);
+  }
+  try {
+    // 默认展开右侧官方助手；仅当用户主动收起过才保持收起
+    if (localStorage.getItem(AGENT_KEY) === '1') setAgentCollapsed(true);
+    else setAgentCollapsed(false);
+  } catch (_) {
+    setAgentCollapsed(false);
   }
   setFabProgress(0, 'idle');
 

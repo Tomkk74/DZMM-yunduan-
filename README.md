@@ -146,7 +146,8 @@ Agent 入口：[`AGENTS.md`](AGENTS.md) → [`_模板/AGENTS.md`](_模板/AGENTS
 | 账号登录 | 邮箱密码 / 登录码 / Telegram / Cookie；可写本机 `.env` |
 | 项目配置 | `character_id`（Workbench 地址栏）、本地项目路径（含 `publish/`）、预览端口（默认 `8791`） |
 | 拉取容器 | 云端整包落地；路径空则默认 `../{character_id}` |
-| 预览 | 启动时若已登录且本地有 `publish/` 会自动拉起；也可在网页里启停；全屏后用悬浮球：菜单 / 刷新 / **增量 sync** / **发布** |
+| 预览 | 顶栏可切 **本地 / 云端**：本地读本机 `publish/`；云端持续镜像容器 `publish` 到旁路目录（不覆盖本地工程）再预览 |
+| 官方助手 | 右侧面板对接 Workbench Chat（Claude / Codex Agent）；需有效游戏卡 `character_id`；改的是云端，可用「云端预览」看效果 |
 | 同步 | 对照 `_sync_meta.json` 增量上传；**换卡 / 无 pull 基线会自动全量**；失败文件会保留待重试；强制全量加 `--full` |
 
 ### 界面截图

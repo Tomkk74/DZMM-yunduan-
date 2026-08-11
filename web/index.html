@@ -248,22 +248,27 @@
       <div id="gameStage" class="stage-mode">
         <header class="stage-bar">
           <div class="stage-title">
-            <strong>本地预览</strong>
+            <strong id="previewTitle">本地预览</strong>
             <span id="previewMeta" class="stage-meta">预览未启动</span>
           </div>
           <div class="actions stage-actions">
+            <div class="preview-source" id="previewSourceSwitch" role="group" aria-label="预览源">
+              <button type="button" class="btn source-btn active" id="previewSrcLocal" data-source="local" title="预览本机工程 publish/">本地</button>
+              <button type="button" class="btn source-btn" id="previewSrcCloud" data-source="cloud" title="持续拉取云端容器 publish 到旁路目录预览，不覆盖本地工程">云端</button>
+            </div>
             <button type="button" class="btn accent" id="previewStartBtn">启动预览</button>
             <button type="button" class="btn" id="previewReloadBtn" title="只刷新中间预览，不刷新控制台">刷新预览</button>
             <button type="button" class="btn" id="previewStopBtn">停止</button>
             <a class="btn" id="previewLink" href="#" target="_blank" rel="noopener">新窗口</a>
             <button type="button" class="btn" id="sidebarCollapseBtn2" title="收起侧栏">全屏</button>
+            <button type="button" class="btn" id="agentToggleBtn" title="显示/隐藏右侧官方助手">助手</button>
           </div>
         </header>
         <div class="stage-frame">
-          <iframe id="previewFrame" title="本地游戏预览" src="about:blank"></iframe>
+          <iframe id="previewFrame" title="游戏预览" src="about:blank"></iframe>
           <div id="previewEmpty" class="stage-empty">
             <p>中间为大屏预览区</p>
-            <p>左侧登录并配置项目后，点「启动预览」</p>
+            <p>可切换「本地 / 云端」：本地读本机工程；云端持续镜像容器 publish</p>
           </div>
         </div>
       </div>
@@ -558,6 +563,37 @@
         </div>
       </div>
     </main>
+
+    <aside class="agent-panel" id="agentPanel" aria-label="官方 AI 助手">
+      <header class="agent-head">
+        <div class="agent-title">
+          <strong>官方助手</strong>
+          <span id="agentMeta" class="agent-meta">Workbench Chat</span>
+        </div>
+        <div class="agent-head-actions">
+          <select id="agentBackend" title="Agent 后端">
+            <option value="claude">Claude</option>
+            <option value="codex">Codex</option>
+          </select>
+          <button type="button" class="btn icon" id="agentReadyBtn" title="连接容器">连接</button>
+          <button type="button" class="btn icon" id="agentCollapseBtn" title="收起助手">收起</button>
+        </div>
+      </header>
+      <div id="agentMsgs" class="agent-msgs" aria-live="polite">
+        <div class="agent-welcome">
+          <p>与官网 Workbench 底部 Chat 同一套官方 Agent。</p>
+          <p>需已登录，且「项目配置」里的 character_id 为游戏卡。</p>
+        </div>
+      </div>
+      <div class="agent-compose">
+        <textarea id="agentInput" rows="3" placeholder="让官方助手改代码、查文件、排错… Enter 发送 · Shift+Enter 换行"></textarea>
+        <div class="agent-compose-actions">
+          <button type="button" class="btn" id="agentCancelBtn" disabled>停止</button>
+          <button type="button" class="btn accent" id="agentSendBtn">发送</button>
+        </div>
+        <p id="agentHint" class="hint">未连接</p>
+      </div>
+    </aside>
   </div>
 
   <div id="textZoomModal" class="text-zoom-modal" hidden>

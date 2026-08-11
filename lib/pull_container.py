@@ -270,6 +270,138 @@ def pull_paths(
     return summary
 
 
+def mirror_remote_publish(
+    character_id: int,
+    mirror_root: Path,
+    *,
+    force: bool = False,
+    should_stop=None,
+) -> dict:
+    """增量镜像容器 /publish → mirror_root/publish（不影响本地工程与 sync 基线）。"""
+    if not character_id:
+        raise ValueError("缺少 character_id")
+    root = Path(mirror_root).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    meta_path = root / "_cloud_mirror_meta.json"
+    prev: dict = {}
+    if meta_path.is_file() and not force:
+        try:
+            prev = json.loads(meta_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            prev = {}
+    prev_files = prev.get("files") if isinstance(prev.get("files"), dict) else {}
+
+    cookie, token, remain, email = s.load_auth()
+    _, game_id = s.ensure_editor(cookie, token, character_id)
+    remote_files = walk(cookie, token, str(game_id), "/publish")
+    if not remote_files:
+        raise RuntimeError("云端 /publish 为空，无法预览")
+    # 先拉 index.html，便于预览尽快可用，其余资源后台继续补全
+    remote_files = sorted(
+        remote_files,
+        key=lambda it: 0 if str(it.get("path") or "").rstrip("/").endswith("/publish/index.html")
+        or str(it.get("path") or "").endswith("index.html")
+        else 1,
+    )
+
+    downloaded = 0
+    skipped = 0
+    failed = 0
+    failed_paths: list[str] = []
+    next_files: dict[str, dict] = {}
+    changed = bool(force) or not prev_files
+    stopped = False
+
+    for item in remote_files:
+        if callable(should_stop) and should_stop():
+            stopped = True
+            break
+        remote = norm_path(str(item.get("path") or ""))
+        if not remote.startswith("/publish"):
+            continue
+        size = int(item.get("size") or 0)
+        modified = str(item.get("modifiedAt") or "")
+        sig = {"size": size, "modifiedAt": modified}
+        next_files[remote] = sig
+        old = prev_files.get(remote) if isinstance(prev_files.get(remote), dict) else None
+        if not force and old and int(old.get("size") or -1) == size and str(old.get("modifiedAt") or "") == modified:
+            local = safe_local_path(root, remote)
+            if local.is_file() and local.stat().st_size == size:
+                skipped += 1
+                continue
+        try:
+            local = safe_local_path(root, remote)
+            local.parent.mkdir(parents=True, exist_ok=True)
+            data = download_raw(cookie, token, str(game_id), remote)
+            local.write_bytes(data)
+            downloaded += 1
+            changed = True
+        except Exception:
+            failed += 1
+            failed_paths.append(remote)
+
+    if stopped:
+        return {
+            "ok": False,
+            "changed": changed,
+            "stopped": True,
+            "characterId": int(character_id),
+            "gameId": str(game_id),
+            "mirrorRoot": str(root),
+            "publishDir": str(root / "publish"),
+            "total": len(remote_files),
+            "downloaded": downloaded,
+            "skipped": skipped,
+            "failed": failed,
+            "failedPaths": failed_paths,
+            "message": f"云端镜像已中断 downloaded={downloaded} skipped={skipped}",
+        }
+
+    # 删除云端已不存在的本地镜像文件
+    for remote in list(prev_files.keys()):
+        if remote in next_files:
+            continue
+        try:
+            local = safe_local_path(root, remote)
+            if local.is_file():
+                local.unlink()
+                changed = True
+        except Exception:
+            pass
+
+    index = root / "publish" / "index.html"
+    if not index.is_file():
+        raise RuntimeError("云端镜像缺少 publish/index.html")
+
+    meta = {
+        "character_id": int(character_id),
+        "game_id": str(game_id),
+        "files": next_files,
+        "updatedAt": __import__("time").time(),
+        "email": email,
+        "remainSec": remain,
+    }
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "ok": failed == 0,
+        "changed": changed,
+        "characterId": int(character_id),
+        "gameId": str(game_id),
+        "mirrorRoot": str(root),
+        "publishDir": str(root / "publish"),
+        "total": len(remote_files),
+        "downloaded": downloaded,
+        "skipped": skipped,
+        "failed": failed,
+        "failedPaths": failed_paths,
+        "message": (
+            f"云端镜像更新 downloaded={downloaded} skipped={skipped} fail={failed}"
+            if changed or downloaded
+            else f"云端无变更 skipped={skipped}"
+        ),
+    }
+
+
 def pull_project(
     character_id: int,
     out: Path | None = None,

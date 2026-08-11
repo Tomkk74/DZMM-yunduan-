@@ -21,6 +21,7 @@ tools/_*
 tools/probe_*.py
 *.log
 .pull_cache/
+.cloud-preview/
 _tmp*
 _rewrite*.py
 node_modules/

@@ -7,6 +7,7 @@ import argparse
 import base64
 import json
 import mimetypes
+import re
 import subprocess
 import sys
 import threading
@@ -22,6 +23,7 @@ KIT = Path(__file__).resolve().parent
 sys.path.insert(0, str(KIT / "lib"))
 import dzmm_studio as studio  # noqa: E402
 import dzmm_character as character  # noqa: E402
+import dzmm_agent as agent  # noqa: E402
 import pull_container as puller  # noqa: E402
 
 WEB_DIR = KIT / "web"
@@ -54,7 +56,26 @@ _PREVIEW_META: dict = {
     "pid": 0,
     "error": "",
     "message": "",
+    "source": "local",
 }
+_CLOUD_MIRROR_LOCK = threading.Lock()
+_CLOUD_MIRROR: dict = {
+    "enabled": False,
+    "running": False,
+    "stop": False,
+    "characterId": 0,
+    "lastAt": 0.0,
+    "changedAt": 0.0,
+    "revision": 0,
+    "message": "",
+    "error": "",
+    "downloaded": 0,
+    "skipped": 0,
+    "intervalSec": 6,
+}
+_CLOUD_MIRROR_THREAD: threading.Thread | None = None
+_CLOUD_MIRROR_GEN = 0
+_PREVIEW_SOURCE = "local"
 
 _SYNC_LOCK = threading.Lock()
 _SYNC_JOB: dict = {
@@ -246,12 +267,27 @@ def _apply_login_side_config(body: dict) -> None:
 def _login_success(email_hint: str | None = None) -> dict:
     studio.refresh_root()
     _c, _t, remain, mail = studio.load_auth(min_remain=0)
-    return {
+    # 换号后立刻让预览桥接重读 cookie / 昵称，避免「链接用户」卡住旧名
+    bridge = None
+    try:
+        bridge = do_bridge_auth_reload()
+        if not bridge.get("ok"):
+            bridge = do_bridge_status(force=True)
+    except Exception:
+        try:
+            bridge = do_bridge_status(force=True)
+        except Exception:
+            bridge = None
+    out = {
         "ok": True,
         "email": mail or email_hint or "",
         "remainSec": remain,
         "status": build_status(),
     }
+    if bridge:
+        out["bridge"] = bridge.get("bridge")
+        out["preview"] = bridge.get("preview")
+    return out
 
 
 def do_login(body: dict) -> dict:
@@ -395,6 +431,76 @@ def do_logout() -> dict:
     return {"ok": True, "status": build_status()}
 
 
+def do_agent_ready(body: dict | None = None) -> dict:
+    body = body or {}
+    try:
+        cid = body.get("characterId")
+        ready = agent.ensure_ready(int(cid) if cid else None)
+        return {"ok": True, **ready, "status": build_status()}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "status": build_status()}
+
+
+def do_agent_sessions(backend: str = "claude") -> dict:
+    try:
+        data = agent.list_sessions(backend=backend or "claude")
+        data["status"] = build_status()
+        return data
+    except Exception as e:
+        return {"ok": False, "error": str(e), "status": build_status()}
+
+
+def do_agent_messages(session_id: str, backend: str = "claude") -> dict:
+    try:
+        data = agent.session_messages(session_id, backend=backend or "claude")
+        data["status"] = build_status()
+        return data
+    except Exception as e:
+        return {"ok": False, "error": str(e), "status": build_status()}
+
+
+def do_agent_send(body: dict) -> dict:
+    try:
+        data = agent.send_prompt(
+            str(body.get("prompt") or ""),
+            backend=str(body.get("backend") or "claude"),
+            resume_session_id=str(body.get("sessionId") or body.get("resumeSessionId") or "").strip() or None,
+            max_turns=int(body.get("maxTurns") or agent.DEFAULT_MAX_TURNS),
+        )
+        data["status"] = build_status()
+        return data
+    except Exception as e:
+        return {"ok": False, "error": str(e), "status": build_status()}
+
+
+def do_agent_poll(body: dict) -> dict:
+    try:
+        data = agent.poll_task(
+            str(body.get("taskId") or ""),
+            backend=str(body.get("backend") or "claude"),
+            since=int(body.get("since") or 0),
+            game_id=str(body.get("gameId") or "").strip() or None,
+        )
+        # 轮询高频：不要附带完整 build_status（体积大且会拖垮连接）
+        data.pop("events", None)
+        data["ok"] = True
+        return data
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def do_agent_cancel(body: dict) -> dict:
+    try:
+        data = agent.cancel_task(
+            str(body.get("taskId") or ""),
+            backend=str(body.get("backend") or "claude"),
+        )
+        data["status"] = build_status()
+        return data
+    except Exception as e:
+        return {"ok": False, "error": str(e), "status": build_status()}
+
+
 def do_ping_editor() -> dict:
     status = build_status()
     if not status["loggedIn"]:
@@ -416,9 +522,83 @@ def do_ping_editor() -> dict:
             "status": build_status(),
         }
     except SystemExit as e:
-        return {"ok": False, "error": str(e), "status": status}
+        return _ping_fail(str(e), status, cid)
     except Exception as e:
-        return {"ok": False, "error": str(e), "status": status}
+        return _ping_fail(str(e), status, cid)
+
+
+_CAPTCHA_OPEN_AT = 0.0
+
+
+def _extract_captcha_path(raw: str) -> str:
+    text = str(raw or "")
+    # 典型: ... captcha_required ... "location":"/__captcha/" ...
+    m = re.search(r'"location"\s*:\s*"([^"]+)"', text)
+    if m:
+        loc = m.group(1).strip() or "/__captcha/"
+        return loc if loc.startswith("/") else f"/{loc}"
+    if "captcha" in text.lower() or "/__captcha/" in text.lower() or "418" in text:
+        return "/__captcha/"
+    return ""
+
+
+def _open_captcha_browser(path: str = "/__captcha/") -> str:
+    """主动弹出系统浏览器打开验证码页；返回完整 URL。短时内去抖。"""
+    global _CAPTCHA_OPEN_AT
+    origin = str(studio.get_origin() or "").rstrip("/")
+    loc = path if path.startswith("/") else f"/{path or '__captcha__'}"
+    url = f"{origin}{loc}"
+    now = time.time()
+    if now - _CAPTCHA_OPEN_AT >= 6.0:
+        _CAPTCHA_OPEN_AT = now
+
+        def _open():
+            try:
+                webbrowser.open(url)
+            except Exception as err:
+                print(f"[console] 打开验证码页失败: {err}")
+
+        threading.Thread(target=_open, name="open-captcha", daemon=True).start()
+        print(f"[console] 已弹出浏览器验证: {url}")
+    return url
+
+
+def _ping_fail(raw: str, status: dict, cid: int = 0) -> dict:
+    captcha_path = _extract_captcha_path(raw)
+    captcha_url = ""
+    if captcha_path:
+        captcha_url = _open_captcha_browser(captcha_path)
+    workbench = ""
+    if cid:
+        workbench = f"{studio.get_origin()}/studio/game-creation/workbench?character_id={cid}"
+    out = {
+        "ok": False,
+        "error": _friendly_ping_error(raw, bool(captcha_url)),
+        "status": status,
+    }
+    if captcha_url:
+        out["captchaRequired"] = True
+        out["captchaUrl"] = captcha_url
+    if workbench:
+        out["workbenchUrl"] = workbench
+    return out
+
+
+def _friendly_ping_error(raw: str, opened: bool = False) -> str:
+    text = str(raw or "")
+    low = text.lower()
+    if "captcha_required" in low or "/__captcha/" in low or "418" in low:
+        if opened:
+            return (
+                "连接编辑器需要过站点验证码，已自动打开浏览器。"
+                "请在弹出页完成验证后，回到控制台再点一次「连接编辑器」。"
+            )
+        return (
+            "连接编辑器需要过站点验证码。"
+            "请用浏览器打开当前 origin 完成验证后，"
+            "再在控制台更新 cookie / 重新登录，然后点「连接编辑器」。"
+        )
+    return text or "连接/创建编辑器失败"
 
 
 def pull_job_snapshot() -> dict:
@@ -672,6 +852,302 @@ def _port_in_use(port: int) -> bool:
             pass
 
 
+def cloud_mirror_root(character_id: int) -> Path:
+    return (KIT / ".cloud-preview" / str(int(character_id))).resolve()
+
+
+def cloud_mirror_snapshot() -> dict:
+    with _CLOUD_MIRROR_LOCK:
+        return {
+            "enabled": bool(_CLOUD_MIRROR.get("enabled")),
+            "running": bool(_CLOUD_MIRROR.get("running")),
+            "characterId": int(_CLOUD_MIRROR.get("characterId") or 0),
+            "lastAt": float(_CLOUD_MIRROR.get("lastAt") or 0),
+            "changedAt": float(_CLOUD_MIRROR.get("changedAt") or 0),
+            "revision": int(_CLOUD_MIRROR.get("revision") or 0),
+            "message": str(_CLOUD_MIRROR.get("message") or ""),
+            "error": str(_CLOUD_MIRROR.get("error") or ""),
+            "downloaded": int(_CLOUD_MIRROR.get("downloaded") or 0),
+            "skipped": int(_CLOUD_MIRROR.get("skipped") or 0),
+            "intervalSec": float(_CLOUD_MIRROR.get("intervalSec") or 6),
+            "mirrorRoot": str(cloud_mirror_root(int(_CLOUD_MIRROR.get("characterId") or 0)))
+            if int(_CLOUD_MIRROR.get("characterId") or 0)
+            else "",
+        }
+
+
+def preview_source_get() -> str:
+    global _PREVIEW_SOURCE
+    return "cloud" if _PREVIEW_SOURCE == "cloud" else "local"
+
+
+def _stop_cloud_mirror() -> None:
+    global _CLOUD_MIRROR_THREAD
+    with _CLOUD_MIRROR_LOCK:
+        _CLOUD_MIRROR["enabled"] = False
+        _CLOUD_MIRROR["stop"] = True
+        _CLOUD_MIRROR["message"] = "已停止云端镜像"
+    th = _CLOUD_MIRROR_THREAD
+    if th and th.is_alive() and th is not threading.current_thread():
+        th.join(timeout=1.5)
+    with _CLOUD_MIRROR_LOCK:
+        if not (_CLOUD_MIRROR_THREAD and _CLOUD_MIRROR_THREAD.is_alive()):
+            _CLOUD_MIRROR_THREAD = None
+            _CLOUD_MIRROR["running"] = False
+
+
+def _cloud_mirror_has_index(character_id: int) -> bool:
+    return (cloud_mirror_root(int(character_id or 0)) / "publish" / "index.html").is_file()
+
+
+def _cloud_mirror_loop(gen: int) -> None:
+    while True:
+        with _CLOUD_MIRROR_LOCK:
+            if gen != _CLOUD_MIRROR_GEN or _CLOUD_MIRROR.get("stop") or not _CLOUD_MIRROR.get("enabled"):
+                if gen == _CLOUD_MIRROR_GEN:
+                    _CLOUD_MIRROR["running"] = False
+                    _CLOUD_MIRROR["enabled"] = False
+                break
+            cid = int(_CLOUD_MIRROR.get("characterId") or 0)
+            interval = max(3.0, float(_CLOUD_MIRROR.get("intervalSec") or 6))
+            force = bool(_CLOUD_MIRROR.pop("forceNext", False))
+        if cid <= 0:
+            time.sleep(1.0)
+            continue
+        if _project_job_busy():
+            with _CLOUD_MIRROR_LOCK:
+                if gen == _CLOUD_MIRROR_GEN:
+                    _CLOUD_MIRROR["message"] = "同步/拉取进行中，云端镜像暂缓…"
+            _sleep_interruptible(interval)
+            continue
+        try:
+            with _CLOUD_MIRROR_LOCK:
+                if gen != _CLOUD_MIRROR_GEN:
+                    break
+                _CLOUD_MIRROR["running"] = True
+                _CLOUD_MIRROR["message"] = "正在拉取云端 publish…"
+                _CLOUD_MIRROR["error"] = ""
+            result = puller.mirror_remote_publish(
+                cid,
+                cloud_mirror_root(cid),
+                force=force,
+                should_stop=lambda: gen != _CLOUD_MIRROR_GEN,
+            )
+            with _CLOUD_MIRROR_LOCK:
+                if gen != _CLOUD_MIRROR_GEN:
+                    break
+                _CLOUD_MIRROR["running"] = False
+                _CLOUD_MIRROR["lastAt"] = time.time()
+                _CLOUD_MIRROR["message"] = str(result.get("message") or "云端已同步")
+                _CLOUD_MIRROR["downloaded"] = int(result.get("downloaded") or 0)
+                _CLOUD_MIRROR["skipped"] = int(result.get("skipped") or 0)
+                _CLOUD_MIRROR["error"] = ""
+                if result.get("changed"):
+                    _CLOUD_MIRROR["changedAt"] = time.time()
+                    _CLOUD_MIRROR["revision"] = int(_CLOUD_MIRROR.get("revision") or 0) + 1
+        except Exception as e:
+            with _CLOUD_MIRROR_LOCK:
+                if gen != _CLOUD_MIRROR_GEN:
+                    break
+                _CLOUD_MIRROR["running"] = False
+                _CLOUD_MIRROR["error"] = str(e)
+                _CLOUD_MIRROR["message"] = f"云端拉取失败：{e}"
+                _CLOUD_MIRROR["lastAt"] = time.time()
+        _sleep_interruptible(interval)
+
+
+def _sleep_interruptible(seconds: float) -> None:
+    end = time.time() + max(0.2, float(seconds))
+    while time.time() < end:
+        with _CLOUD_MIRROR_LOCK:
+            if _CLOUD_MIRROR.get("stop") or not _CLOUD_MIRROR.get("enabled"):
+                return
+        time.sleep(0.25)
+
+
+def _await_and_start_cloud_preview(character_id: int, status: dict) -> None:
+    """后台等镜像出现 index.html 后自动启动云端预览。"""
+    cid = int(character_id or 0)
+    deadline = time.time() + 600
+    while time.time() < deadline:
+        if preview_source_get() != "cloud":
+            return
+        with _CLOUD_MIRROR_LOCK:
+            if int(_CLOUD_MIRROR.get("characterId") or 0) != cid:
+                return
+            err = str(_CLOUD_MIRROR.get("error") or "")
+            running = bool(_CLOUD_MIRROR.get("running"))
+            enabled = bool(_CLOUD_MIRROR.get("enabled"))
+        if not enabled:
+            return
+        if _cloud_mirror_has_index(cid):
+            snap = preview_snapshot()
+            if snap.get("running") and snap.get("source") == "cloud":
+                return
+            do_start_preview({
+                "characterId": cid,
+                "projectPath": status.get("projectPath") or "",
+                "previewPort": status.get("previewPort") or 8791,
+                "source": "cloud",
+            })
+            return
+        if err and not running:
+            # 留给轮询展示错误；短暂等待以便重试循环再跑
+            time.sleep(2.0)
+        else:
+            time.sleep(0.8)
+
+
+def _start_cloud_mirror(character_id: int, *, force_first: bool | None = None) -> dict:
+    """启动后台镜像线程（不阻塞请求）。有本地缓存时增量；无 index 时强制首拉。"""
+    global _CLOUD_MIRROR_THREAD, _CLOUD_MIRROR_GEN
+    cid = int(character_id or 0)
+    if cid <= 0:
+        raise RuntimeError("缺少 character_id")
+    _stop_cloud_mirror()
+    has_index = _cloud_mirror_has_index(cid)
+    if force_first is None:
+        force_first = not has_index
+    with _CLOUD_MIRROR_LOCK:
+        _CLOUD_MIRROR_GEN += 1
+        gen = _CLOUD_MIRROR_GEN
+        _CLOUD_MIRROR.update({
+            "enabled": True,
+            "stop": False,
+            "running": False,
+            "characterId": cid,
+            "forceNext": bool(force_first),
+            "message": (
+                "正在拉取云端 publish…"
+                if force_first or not has_index
+                else "云端镜像后台增量同步中…"
+            ),
+            "error": "",
+            "downloaded": 0,
+            "skipped": 0,
+        })
+        _CLOUD_MIRROR_THREAD = threading.Thread(
+            target=_cloud_mirror_loop,
+            args=(gen,),
+            name="dzmm-cloud-mirror",
+            daemon=True,
+        )
+        _CLOUD_MIRROR_THREAD.start()
+    return {
+        "ok": True,
+        "pending": not has_index,
+        "hasIndex": has_index,
+        "forceFirst": bool(force_first),
+        "mirrorRoot": str(cloud_mirror_root(cid)),
+        "message": "已启动云端镜像线程",
+    }
+
+
+def do_preview_source_get() -> dict:
+    cid = int(cloud_mirror_snapshot().get("characterId") or 0)
+    if not cid:
+        try:
+            cid = int((build_status() or {}).get("characterId") or 0)
+        except Exception:
+            cid = 0
+    desired = preview_source_get()
+    pending = desired == "cloud" and (not cid or not _cloud_mirror_has_index(cid))
+    return {
+        "ok": True,
+        "source": desired,
+        "desiredSource": desired,
+        "preview": preview_snapshot(),
+        "cloud": cloud_mirror_snapshot(),
+        "pending": pending,
+        "status": build_status(),
+    }
+
+
+def do_preview_source_set(body: dict) -> dict:
+    """切换预览源：local=本机工程；cloud=持续镜像容器 /publish 到旁路目录再预览。"""
+    global _PREVIEW_SOURCE
+    mode = str((body or {}).get("source") or (body or {}).get("mode") or "local").strip().lower()
+    if mode not in ("local", "cloud"):
+        return {"ok": False, "error": "source 仅支持 local / cloud", "status": build_status()}
+
+    status = build_status()
+    if not status.get("loggedIn"):
+        return {"ok": False, "error": "尚未登录", "status": status}
+    cid = int(status.get("characterId") or 0)
+    if body.get("characterId") not in (None, ""):
+        try:
+            cid = int(body.get("characterId") or cid)
+        except Exception:
+            pass
+    if not cid:
+        return {"ok": False, "error": "请先填写 character_id", "status": status}
+
+    was_running = bool(preview_snapshot().get("running"))
+    try:
+        if mode == "cloud":
+            first = _start_cloud_mirror(cid)
+            _PREVIEW_SOURCE = "cloud"
+            if first.get("hasIndex"):
+                result = do_start_preview({
+                    "characterId": cid,
+                    "projectPath": status.get("projectPath") or "",
+                    "previewPort": status.get("previewPort") or 8791,
+                    "source": "cloud",
+                })
+                if not result.get("ok"):
+                    _stop_cloud_mirror()
+                    _PREVIEW_SOURCE = "local"
+                    return result
+                result["source"] = "cloud"
+                result["desiredSource"] = "cloud"
+                result["cloud"] = cloud_mirror_snapshot()
+                result["mirror"] = first
+                result["pending"] = False
+                result["message"] = "已切换到云端预览（持续拉取容器 publish，不覆盖本地工程）"
+                return result
+
+            # 首次拉取：先停本地预览，避免界面误显示「已是云端」
+            do_stop_preview()
+            threading.Thread(
+                target=_await_and_start_cloud_preview,
+                args=(cid, status),
+                name="dzmm-cloud-preview-boot",
+                daemon=True,
+            ).start()
+            return {
+                "ok": True,
+                "pending": True,
+                "source": "cloud",
+                "desiredSource": "cloud",
+                "preview": preview_snapshot(),
+                "cloud": cloud_mirror_snapshot(),
+                "mirror": first,
+                "status": build_status(),
+                "message": "正在首次拉取云端 publish，完成后自动打开预览（不覆盖本地工程）…",
+            }
+
+        _stop_cloud_mirror()
+        _PREVIEW_SOURCE = "local"
+        if was_running:
+            result = do_start_preview({
+                "characterId": cid,
+                "projectPath": status.get("projectPath") or "",
+                "previewPort": status.get("previewPort") or 8791,
+                "source": "local",
+            })
+        else:
+            result = {"ok": True, "preview": preview_snapshot(), "status": build_status()}
+        result["source"] = "local"
+        result["cloud"] = cloud_mirror_snapshot()
+        result["pending"] = False
+        result["message"] = "已切换到本地预览"
+        return result
+    except Exception as e:
+        _stop_cloud_mirror()
+        _PREVIEW_SOURCE = "local"
+        return {"ok": False, "error": str(e), "source": "local", "status": build_status()}
+
+
 def preview_snapshot() -> dict:
     global _PREVIEW_PROC
     with _PREVIEW_LOCK:
@@ -695,7 +1171,12 @@ def preview_snapshot() -> dict:
                 _PREVIEW_META["message"] = f"预览运行中 {url}"
         _PREVIEW_META["running"] = running
         _PREVIEW_META["url"] = url if running or _PREVIEW_META.get("url") else ""
-        return dict(_PREVIEW_META)
+        # meta.source = 实际在播的目录；顶层 desiredSource = 用户选择的本地/云端
+        snap = dict(_PREVIEW_META)
+        snap["source"] = str(_PREVIEW_META.get("source") or "local")
+        snap["desiredSource"] = preview_source_get()
+        snap["cloud"] = cloud_mirror_snapshot()
+        return snap
 
 
 def _kill_port_listeners(port: int) -> None:
@@ -749,6 +1230,8 @@ def _stop_preview_locked() -> None:
         "url": "",
         "message": "预览已停止",
         "error": "",
+        "source": "local",
+        "publishDir": "",
     })
 
 
@@ -775,7 +1258,7 @@ def _preview_http_json(path: str, method: str = "GET", body: dict | None = None,
         return json.loads(raw.decode("utf-8", "replace") or "{}")
 
 
-def do_bridge_status() -> dict:
+def do_bridge_status(force: bool = False) -> dict:
     preview = preview_snapshot()
     if not preview.get("running"):
         return {
@@ -785,7 +1268,8 @@ def do_bridge_status() -> dict:
             "bridge": None,
         }
     try:
-        health = _preview_http_json("/health")
+        path = "/health?force=1" if force else "/health"
+        health = _preview_http_json(path)
         return {"ok": True, "preview": preview, "bridge": health}
     except Exception as e:
         return {
@@ -794,6 +1278,24 @@ def do_bridge_status() -> dict:
             "preview": preview,
             "bridge": None,
         }
+
+
+def do_bridge_auth_reload() -> dict:
+    """登录切换后强制预览进程重读 cookie / 昵称。"""
+    preview = preview_snapshot()
+    if not preview.get("running"):
+        return {"ok": False, "error": "预览未启动", "preview": preview}
+    try:
+        data = _preview_http_json("/_dzmm/auth/reload", method="POST", body={})
+        health = _preview_http_json("/health?force=1")
+        return {"ok": True, "reload": data, "preview": preview, "bridge": health}
+    except Exception as e:
+        # 旧预览进程可能还没有 /_dzmm/auth/reload，退化为 force health
+        try:
+            health = _preview_http_json("/health?force=1")
+            return {"ok": True, "reload": None, "preview": preview, "bridge": health, "warn": str(e)}
+        except Exception as e2:
+            return {"ok": False, "error": str(e2), "preview": preview}
 
 
 def do_bridge_publish(body: dict) -> dict:
@@ -1723,8 +2225,13 @@ def do_start_preview(body: dict) -> dict:
 
     if not project:
         project = str(puller.default_out_dir(cid))
+    global _PREVIEW_SOURCE
+    source = str(body.get("source") or preview_source_get() or "local").strip().lower()
+    if source not in ("local", "cloud"):
+        source = "local"
+
     resolved = studio.resolve_game_project(project)
-    if not resolved.get("ok"):
+    if source == "local" and not resolved.get("ok"):
         err = resolved.get("error") or "本地项目无法预览"
         failed_n = len(resolved.get("failedPaths") or [])
         return {
@@ -1735,13 +2242,29 @@ def do_start_preview(body: dict) -> dict:
             "status": build_status(),
         }
 
-    project_path = Path(resolved["root"])
-    publish_dir = Path(resolved["publish_dir"])
-    hint = str(resolved.get("hint") or "")
+    project_path = Path(resolved["root"]) if resolved.get("ok") else Path(project).expanduser()
+    publish_dir = Path(resolved["publish_dir"]) if resolved.get("ok") else (project_path / "publish")
+    hint = str(resolved.get("hint") or "") if resolved.get("ok") else ""
+    _PREVIEW_SOURCE = source
+    if source == "cloud":
+        mirror_root = cloud_mirror_root(cid)
+        cloud_pub = mirror_root / "publish"
+        if not (cloud_pub / "index.html").is_file():
+            return {
+                "ok": False,
+                "pending": True,
+                "error": "云端镜像尚未就绪（缺少 publish/index.html），请稍候或先点「云端」预览",
+                "status": build_status(),
+            }
+        # 预览进程指向旁路目录，避免覆盖本地工程
+        project_path = mirror_root
+        publish_dir = cloud_pub
+        hint = (("云端镜像 · " + hint) if hint else "云端镜像预览").strip(" ·")
 
+    cfg_root = str(resolved["root"]) if resolved.get("ok") else str(Path(project).expanduser())
     studio.save_config({
         "character_id": cid,
-        "project_path": str(project_path),
+        "project_path": cfg_root,  # 配置仍记本地工程根
         "preview_port": port,
     })
 
@@ -1800,6 +2323,7 @@ def do_start_preview(body: dict) -> dict:
             "error": "",
             "message": boot_msg,
             "logPath": str(log_path),
+            "source": source,
         })
 
     # 用 /health 探测就绪，不再依赖 stdout 管道
@@ -1905,10 +2429,15 @@ class Handler(BaseHTTPRequestHandler):
             _json(self, 200, {"ok": True, "job": sync_job_snapshot()})
             return
         if path == "/api/preview":
-            _json(self, 200, {"ok": True, "preview": preview_snapshot()})
+            _json(self, 200, {"ok": True, "preview": preview_snapshot(), "source": preview_source_get(), "cloud": cloud_mirror_snapshot()})
+            return
+        if path == "/api/preview/source":
+            _json(self, 200, do_preview_source_get())
             return
         if path == "/api/bridge":
-            _json(self, 200, do_bridge_status())
+            qs = urllib.parse.parse_qs(parsed.query or "")
+            force = str((qs.get("force") or ["0"])[0]).lower() in ("1", "true", "yes")
+            _json(self, 200, do_bridge_status(force=force))
             return
         if path == "/api/bridge/publish":
             _json(self, 200, do_bridge_publish_status())
@@ -2008,6 +2537,22 @@ class Handler(BaseHTTPRequestHandler):
             result = do_card_play_settings_get(chat_id)
             _json(self, 200 if result.get("ok") else 400, result)
             return
+        if path == "/api/agent/ready":
+            _json(self, 200, do_agent_ready({}))
+            return
+        if path == "/api/agent/sessions":
+            qs = urllib.parse.parse_qs(parsed.query or "")
+            backend = (qs.get("backend") or ["claude"])[0]
+            result = do_agent_sessions(backend)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/agent/messages":
+            qs = urllib.parse.parse_qs(parsed.query or "")
+            session_id = (qs.get("sessionId") or [""])[0]
+            backend = (qs.get("backend") or ["claude"])[0]
+            result = do_agent_messages(session_id, backend)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
         self._serve_static(path)
 
     def do_POST(self):
@@ -2062,10 +2607,21 @@ class Handler(BaseHTTPRequestHandler):
             _json(self, 200 if result.get("ok") else 400, result)
             return
         if path == "/api/preview/stop":
+            _stop_cloud_mirror()
+            global _PREVIEW_SOURCE
+            _PREVIEW_SOURCE = "local"
             _json(self, 200, do_stop_preview())
+            return
+        if path == "/api/preview/source":
+            result = do_preview_source_set(body)
+            _json(self, 200 if result.get("ok") else 400, result)
             return
         if path == "/api/bridge/publish":
             result = do_bridge_publish(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/bridge/reload":
+            result = do_bridge_auth_reload()
             _json(self, 200 if result.get("ok") else 400, result)
             return
         if path == "/api/sync":
@@ -2130,6 +2686,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/card/play/send":
             _proxy_card_play_generate(self, body)
+            return
+        if path == "/api/agent/ready":
+            result = do_agent_ready(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/agent/send":
+            result = do_agent_send(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/agent/poll":
+            result = do_agent_poll(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
+        if path == "/api/agent/cancel":
+            result = do_agent_cancel(body)
+            _json(self, 200 if result.get("ok") else 400, result)
             return
         _json(self, 404, {"ok": False, "error": "not found"})
 

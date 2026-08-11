@@ -154,6 +154,56 @@ BRIDGE_JS = r"""
     return { value };
   }
 
+  const boardLocalKey = "tk_message_board_local_v1";
+  const boardPageSize = 20;
+  const boardMaxStore = 200;
+  function boardRead() {
+    try {
+      const raw = localStorage.getItem(boardLocalKey);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch { return []; }
+  }
+  function boardWrite(rows) {
+    try { localStorage.setItem(boardLocalKey, JSON.stringify((rows || []).slice(0, boardMaxStore))); } catch {}
+  }
+  function boardPage(all, pageRaw) {
+    const total = all.length;
+    const totalPages = Math.max(1, Math.ceil(total / boardPageSize) || 1);
+    let page = Math.floor(Number(pageRaw) || 1);
+    if (page < 1) page = 1;
+    if (page > totalPages) page = totalPages;
+    const start = (page - 1) * boardPageSize;
+    return {
+      ok: true,
+      local: true,
+      rows: all.slice(start, start + boardPageSize),
+      page,
+      pageSize: boardPageSize,
+      total,
+      totalPages,
+    };
+  }
+  function localBoardInvoke(body) {
+    const method = String((body && body.method) || "list");
+    const all = boardRead();
+    if (method === "list") return boardPage(all, body && body.page);
+    if (method === "post") {
+      const text = String((body && body.text) || "").replace(/\s+/g, " ").trim().slice(0, 100);
+      if (!text) return { ok: false, error: "empty", message: "请输入留言内容" };
+      const item = {
+        id: Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8),
+        text,
+        name: "本地预览",
+        at: Date.now(),
+      };
+      const next = [item].concat(all).slice(0, boardMaxStore);
+      boardWrite(next);
+      return Object.assign(boardPage(next, 1), { item });
+    }
+    return { ok: false, error: "unknown_method", message: "未知操作" };
+  }
+
   const dzmm = {
     __localPreviewBridge: true,
     toast: {
@@ -257,6 +307,10 @@ BRIDGE_JS = r"""
           }
           const token = "local-" + now.toString(36) + "-" + Math.random().toString(36).slice(2, 10);
           return { ok: true, token, exp: now + ttl, ttlMs: ttl, local: true };
+        }
+        // 留言板：本地预览不打云端函数（常 429/502），用内存模拟分页
+        if (String(name || "") === "board") {
+          return localBoardInvoke(body || {});
         }
         try {
           const data = await api("/fn/invoke", { method: "POST", body: { name, body: body || {} } });
@@ -363,16 +417,26 @@ class PreviewState:
 
     def refresh(self, force: bool = False):
         with self.lock:
-            if not force and self._remain_now() > 90 and self.chat_id:
-                return
             try:
                 cookie, token, remain, email = self.studio.load_auth()
-                self.cookie, self.token, self.remain, self.email = cookie, token, remain, email
-                self.auth_checked_at = time.time()
             except Exception as e:
                 print(f"[preview] load_auth fail (local-only mode): {e}")
                 self.auth_checked_at = time.time()
                 return
+
+            auth_changed = (token != self.token) or (email != self.email) or (cookie != self.cookie)
+            # 登录态仍够用时跳过重活，但账号/cookie 一旦变化必须立刻重拉昵称
+            if not force and not auth_changed and self._remain_now() > 90 and self.chat_id:
+                self.cookie, self.token, self.remain, self.email = cookie, token, remain, email
+                self.auth_checked_at = time.time()
+                return
+
+            if auth_changed:
+                self.display_name = ""
+                self.chat_id = ""
+
+            self.cookie, self.token, self.remain, self.email = cookie, token, remain, email
+            self.auth_checked_at = time.time()
             try:
                 info, game_id = self.studio.ensure_editor(cookie, token, self.character_id)
                 self.game_id = str(game_id)
@@ -418,12 +482,17 @@ class PreviewState:
                         full = str(me.get("fullName") or me.get("name") or "").strip()
                         if full:
                             self.display_name = full[:40]
+                        elif auth_changed or force or not self.display_name:
+                            self.display_name = ""
             except Exception as e:
                 print(f"[preview] user name fail: {e}")
+            if not self.display_name and self.email:
+                self.display_name = str(self.email).split("@", 1)[0][:40]
             print(
                 f"[preview] auth={self.email or '?'} name={self.display_name or '—'} "
                 f"remain={self._remain_now()}s gameId={self.game_id} "
                 f"chatId={(self.chat_id or '')[:8] or '—'}… status={(info or {}).get('status')}"
+                f"{' [auth-changed]' if auth_changed else ''}{' [force]' if force else ''}"
             )
 
     def _set_publish_job(self, **kwargs):
@@ -653,8 +722,10 @@ def make_handler(state: PreviewState):
             if path in ("/", "/index.html", "/preview"):
                 return self.serve_index()
             if path == "/health":
+                qs = urllib.parse.parse_qs(parsed.query or "")
+                force = str((qs.get("force") or ["0"])[0]).lower() in ("1", "true", "yes")
                 try:
-                    state.refresh()
+                    state.refresh(force=force)
                 except Exception:
                     pass
                 remain_sec = max(0, state._remain_now())
@@ -716,6 +787,23 @@ def make_handler(state: PreviewState):
                     return self.proxy_chat_models()
                 if path == "/_dzmm/draw/generate":
                     return self.proxy_draw_generate(body)
+                if path == "/_dzmm/auth/reload":
+                    state.refresh(force=True)
+                    remain_sec = max(0, state._remain_now())
+                    return self._send(
+                        200,
+                        json.dumps(
+                            {
+                                "ok": True,
+                                "loggedIn": state.is_logged_in(),
+                                "email": state.email,
+                                "displayName": state.display_name or "",
+                                "remainSec": remain_sec,
+                            },
+                            ensure_ascii=False,
+                        ).encode("utf-8"),
+                        "application/json",
+                    )
                 if path == "/_dzmm/studio/publish":
                     job = state.start_publish(str((body or {}).get("message") or "publish from local preview"))
                     return self._send(200, json.dumps(job, ensure_ascii=False).encode("utf-8"), "application/json")
@@ -801,11 +889,33 @@ def make_handler(state: PreviewState):
             if local_path is not None:
                 return self._send_file(local_path, self._guess_ctype(local_path))
             url = f"{_origin()}/api/game-studio/proxy/{state.game_id}/static/{rel}"
+            st, raw, hdr = 502, b"", {}
             try:
                 st, raw, hdr = state.upstream("GET", url)
             except Exception as e:
                 print(f"[preview] static upstream fail {rel}: {e}", flush=True)
                 return self._send(502, f"static proxy failed: {e}".encode("utf-8"), "text/plain; charset=utf-8")
+            # 云端限流时短暂退避重试；仍失败则再看本地是否刚镜像好
+            if st == 429:
+                for wait in (0.6, 1.2):
+                    time.sleep(wait)
+                    local_path = self._local_static_path(rel)
+                    if local_path is not None:
+                        return self._send_file(local_path, self._guess_ctype(local_path))
+                    try:
+                        st, raw, hdr = state.upstream("GET", url)
+                    except Exception as e:
+                        print(f"[preview] static 429 retry fail {rel}: {e}", flush=True)
+                        break
+                    if st != 429 and raw:
+                        break
+                if st == 429:
+                    print(f"[preview] static 429 {rel}", flush=True)
+                    return self._send(
+                        429,
+                        b"Too Many Requests (cloud static rate limit); wait and refresh",
+                        "text/plain; charset=utf-8",
+                    )
             if st in (400, 401, 403, 404) or not raw:
                 if st in (401, 403):
                     try:
