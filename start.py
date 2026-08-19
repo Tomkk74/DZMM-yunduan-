@@ -160,7 +160,7 @@ def main() -> int:
     print("  DZMM 本地开发 · 一键启动")
     print("========================================")
     print(f"  控制台  http://127.0.0.1:{args.port}/")
-    print(f"  预览口  {args.preview_port}（登录且项目就绪时自动拉起）")
+    print(f"  预览口  {args.preview_port}（游戏卡模式且项目就绪时自动拉起；角色卡模式跳过）")
     print("========================================")
     print()
 

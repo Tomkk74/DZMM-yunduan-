@@ -211,7 +211,42 @@ def build_status() -> dict:
         "projectResolveError": resolved.get("error") or "",
         "pullFailedCount": len(resolved.get("failedPaths") or []),
         "error": error,
+        "consoleMode": _console_mode_from_cfg(cfg),
         "preview": preview_snapshot(),
+    }
+
+
+def _console_mode_from_cfg(cfg: dict | None = None) -> str:
+    raw = str((cfg or studio.load_config()).get("console_mode") or "game").strip().lower()
+    return "card" if raw == "card" else "game"
+
+
+def do_console_mode_get() -> dict:
+    return {"ok": True, "mode": _console_mode_from_cfg(), "status": build_status()}
+
+
+def do_console_mode_set(body: dict | None = None) -> dict:
+    """切换控制台偏好：角色卡模式会停掉游戏预览，只保留登录态供写卡/试玩。"""
+    body = body or {}
+    mode = str(body.get("mode") or "").strip().lower()
+    if mode not in ("card", "game"):
+        return {"ok": False, "error": "mode 须为 card 或 game", "status": build_status()}
+    studio.save_config({"console_mode": mode})
+    preview = None
+    if mode == "card":
+        try:
+            _stop_cloud_mirror()
+        except Exception:
+            pass
+        global _PREVIEW_SOURCE
+        _PREVIEW_SOURCE = "local"
+        preview = do_stop_preview().get("preview")
+    return {
+        "ok": True,
+        "mode": mode,
+        "preview": preview,
+        "message": "已切换到角色卡（游戏预览已停）" if mode == "card" else "已切换到游戏卡",
+        "status": build_status(),
     }
 
 
@@ -1400,8 +1435,10 @@ def _run_sync_job(cid: int, message: str, only, full: bool = False) -> None:
         _, game_id = studio.ensure_editor(cookie, token, cid)
         _sync_set(gameId=str(game_id or ""), phase="auth", message="连接编辑器…")
 
-        files = studio.list_local_files()
-        if isinstance(only, list) and only:
+        all_local = studio.list_local_files()
+        partial = isinstance(only, list) and bool(only)
+        files = all_local
+        if partial:
             only_set = {str(p).replace("\\", "/") for p in only}
             files = [f for f in files if f.relative_to(studio.ROOT).as_posix() in only_set]
         if not files:
@@ -1430,23 +1467,12 @@ def _run_sync_job(cid: int, message: str, only, full: bool = False) -> None:
                 total=0,
             )
             return
-        git_pending = bool(meta.get("gitSavePending"))
-        if not to_upload and not git_pending:
-            _sync_set(
-                running=False,
-                done=True,
-                phase="done",
-                message="无变更文件，已跳过",
-                ok=0,
-                fail=0,
-                error="",
-                current=0,
-                total=0,
-            )
-            return
 
         ok = fail = 0
         fails: list[str] = []
+        deleted_n = 0
+        git_pending = bool(meta.get("gitSavePending"))
+
         if to_upload:
             total = len(to_upload)
             upload_label = "全量上传" if mode in ("full", "retarget") else "增量上传"
@@ -1478,6 +1504,9 @@ def _run_sync_job(cid: int, message: str, only, full: bool = False) -> None:
                     fails=list(fails),
                     message=f"{upload_label} {i}/{total}" + (f"（失败 {fail}）" if fail else ""),
                 )
+            # drop signatures for local files that no longer exist
+            keep_rels = {p.relative_to(studio.ROOT).as_posix() for p in all_local}
+            entries = {k: v for k, v in entries.items() if k in keep_rels}
             meta["files"] = entries
             meta["character_id"] = cid
             studio.save_sync_meta(meta)
@@ -1494,13 +1523,91 @@ def _run_sync_job(cid: int, message: str, only, full: bool = False) -> None:
                 )
                 return
         else:
-            _sync_set(phase="git", message="无文件变更，补做容器 git save…", total=0, current=0)
+            # prune stale meta keys even when nothing to upload
+            keep_rels = {p.relative_to(studio.ROOT).as_posix() for p in all_local}
+            prev = dict(meta.get("files") or {})
+            cleaned = {k: v for k, v in prev.items() if k in keep_rels}
+            if cleaned != prev:
+                meta["files"] = cleaned
+                meta["character_id"] = cid
+                studio.save_sync_meta(meta)
+
+        # 整包同步才对照本地删容器多余文件；指定 only 时不删，避免误伤
+        prune_err = ""
+        if not partial:
+            _sync_set(phase="prune", message="清理容器多余文件…", current=0, total=0)
+            prune = None
+            last_prune_err: Exception | None = None
+            for attempt in range(1, 4):
+                try:
+                    prune = studio.prune_remote_extras(cookie, token, game_id, all_local)
+                    last_prune_err = None
+                    break
+                except Exception as e:
+                    last_prune_err = e
+                    _sync_set(
+                        phase="prune",
+                        message=f"清理连接中断，正在重试（{attempt}/3）…",
+                    )
+                    time.sleep(0.8 * attempt)
+            if prune is None:
+                prune_err = str(last_prune_err or "清理失败")
+                prune = {"ok": 0, "fails": [prune_err], "deleted": []}
+                fails.append(f"清理失败：{prune_err}")
+            deleted_n = int(prune.get("ok") or 0)
+            prune_fails = list(prune.get("fails") or [])
+            if prune_fails:
+                fails.extend(prune_fails[: max(0, 8 - len(fails))])
+            if prune_err:
+                # 上传已成功：不因列目录 SSL 掐断而跳过 git save
+                _sync_set(
+                    phase="prune",
+                    message="清理因线路中断未完成，先保存已上传文件…",
+                    fails=list(fails),
+                )
+            elif prune_fails and deleted_n == 0 and not to_upload and not git_pending:
+                _sync_set(
+                    running=False,
+                    done=True,
+                    phase="error",
+                    error=f"清理多余文件失败：{prune_fails[0]}",
+                    message="同步失败：清理多余文件出错",
+                    ok=ok,
+                    fail=len(prune_fails),
+                    fails=fails,
+                )
+                return
+            elif deleted_n:
+                _sync_set(
+                    phase="prune",
+                    message=f"已删除多余 {deleted_n} 个" + (f"（失败 {len(prune_fails)}）" if prune_fails else ""),
+                    ok=ok,
+                    fail=fail + len(prune_fails),
+                    fails=list(fails),
+                )
+
+        need_git = bool(to_upload or deleted_n or git_pending)
+        if not need_git:
+            _sync_set(
+                running=False,
+                done=True,
+                phase="done",
+                message="无变更文件，已跳过",
+                ok=0,
+                fail=0,
+                error="",
+                current=0,
+                total=0,
+            )
+            return
 
         done_label = {
             "retarget": "换卡全量同步",
             "full": "全量同步",
         }.get(mode, "增量同步")
-        if not to_upload and git_pending:
+        if not to_upload and deleted_n and not git_pending:
+            done_label = "清理多余文件"
+        elif not to_upload and git_pending:
             done_label = "补做 git save"
         _sync_set(phase="git", message="保存容器 git…")
         try:
@@ -1524,14 +1631,19 @@ def _run_sync_job(cid: int, message: str, only, full: bool = False) -> None:
                 fails=[str(e)],
             )
             return
+        msg = f"已{done_label} {ok} 个文件并保存"
+        if deleted_n:
+            msg = f"已{done_label} 上传 {ok}、删除多余 {deleted_n} 并保存"
+        if prune_err:
+            msg += "；清理因线路中断未完成，下次同步会再清"
         _sync_set(
             running=False,
             done=True,
             phase="done",
-            message=f"已{done_label} {ok} 个文件并保存",
+            message=msg,
             ok=ok,
-            fail=0,
-            error="",
+            fail=0 if not prune_err else 1,
+            error=prune_err,
         )
     except SystemExit as e:
         _sync_set(running=False, done=True, phase="error", error=str(e), message=f"同步失败：{e}")
@@ -2119,6 +2231,10 @@ def do_card_publish(body: dict) -> dict:
             "cloudId": saved.get("cloudId"),
             "characterUrl": saved.get("characterUrl") or "",
             "result": saved.get("result"),
+            "clearedDrafts": saved.get("clearedDrafts") or [],
+            "clearedDraftCount": int(saved.get("clearedDraftCount") or 0),
+            "draftSync": saved.get("draftSync") or {},
+            "syncedDraftId": saved.get("syncedDraftId"),
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -2379,6 +2495,7 @@ _QUIET_OK_PATH_PREFIXES = (
     "/api/ping",
     "/api/pull",
     "/api/sync",
+    "/api/console-mode",
 )
 
 
@@ -2418,6 +2535,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/origin":
             _json(self, 200, do_origin_get())
+            return
+        if path == "/api/console-mode":
+            _json(self, 200, do_console_mode_get())
             return
         if path == "/api/ping":
             _json(self, 200, do_ping_editor())
@@ -2583,6 +2703,10 @@ class Handler(BaseHTTPRequestHandler):
             result = do_origin_set(body)
             _json(self, 200 if result.get("ok") else 400, result)
             return
+        if path == "/api/console-mode":
+            result = do_console_mode_set(body)
+            _json(self, 200 if result.get("ok") else 400, result)
+            return
         if path == "/api/config":
             result = do_save_config(body)
             _json(self, 200, result)
@@ -2730,6 +2854,9 @@ def _try_auto_preview() -> None:
     """登录且本地 publish 就绪时自动拉起预览（供 start.py --auto-preview）。"""
     time.sleep(0.35)
     try:
+        if _console_mode_from_cfg() == "card":
+            print("[console] 自动预览跳过：当前偏好角色卡模式（只需登录态写卡）")
+            return
         status = build_status()
         if not status.get("loggedIn"):
             print("[console] 自动预览跳过：尚未登录（网页登录后可手动启动预览）")

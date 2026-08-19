@@ -1717,6 +1717,12 @@ textarea.mono {
   pointer-events: none;
 }
 
+.fab-label.is-count {
+  font-size: 11px;
+  letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+}
+
 @media (max-width: 960px) {
   .app:not(.is-collapsed):not(.is-card-mode) {
     grid-template-columns: 1fr;

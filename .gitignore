@@ -4,8 +4,6 @@ cards/*.json
 卡/*/
 !卡/README.md
 !卡/AGENTS.md
-!卡/少女的春之梦/
-!卡/少女的春之梦/**
 .probe-character-api/
 __pycache__/
 *.pyc

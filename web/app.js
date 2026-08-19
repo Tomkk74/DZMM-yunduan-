@@ -269,7 +269,7 @@
     }
   }
 
-  function setFabProgress(percent, mode) {
+  function setFabProgress(percent, mode, counts) {
     var prog = $('fabProg');
     var fab = $('fabPublish');
     var label = $('fabLabel');
@@ -277,7 +277,12 @@
     var p = Math.max(0, Math.min(100, Number(percent) || 0));
     prog.style.strokeDasharray = String(FAB_CIRC);
     prog.style.strokeDashoffset = String(FAB_CIRC * (1 - p / 100));
-    fab.classList.remove('is-ok', 'is-err');
+    fab.classList.remove('is-ok', 'is-err', 'is-run');
+    if (label) {
+      label.classList.remove('is-count');
+      label.style.fontSize = '';
+      label.style.letterSpacing = '';
+    }
     if (mode === 'ok') {
       fab.classList.add('is-ok');
       label.textContent = '完成';
@@ -285,10 +290,60 @@
       fab.classList.add('is-err');
       label.textContent = '失败';
     } else if (mode === 'run') {
-      label.textContent = Math.round(p) + '%';
+      fab.classList.add('is-run');
+      var total = counts && Number(counts.total) || 0;
+      var cur = counts && Number(counts.current) || 0;
+      if (total > 0 && label) {
+        label.textContent = cur + '/' + total;
+        label.classList.add('is-count');
+        label.title = Math.round(p) + '%';
+      } else if (label) {
+        label.textContent = Math.round(p) + '%';
+      }
     } else {
       label.textContent = '发布';
     }
+  }
+
+  function applyPublishJob(job) {
+    job = job || {};
+    var wrap = $('publishBarWrap');
+    var bar = $('publishBar');
+    var total = Number(job.total) || 0;
+    var cur = Number(job.current != null ? job.current : job.synced) || 0;
+    var pct = Number(job.percent) || 0;
+    if (job.status === 'running' && total > 0) {
+      pct = Math.max(pct, Math.round(38 + 59 * cur / total));
+    }
+    pct = Math.max(0, Math.min(100, pct));
+    if (job.status === 'running') {
+      if (wrap) wrap.hidden = false;
+      if (bar) bar.style.width = Math.max(8, pct || 8) + '%';
+      var msg = job.message || '发布中…';
+      if (total > 0 && msg.indexOf(String(cur) + '/' + String(total)) < 0) {
+        msg = '发布中 ' + cur + '/' + total + '（' + Math.round(pct) + '%）';
+      } else if (total > 0 && msg.indexOf('%') < 0) {
+        msg += '（' + Math.round(pct) + '%）';
+      }
+      if ($('publishMsg')) $('publishMsg').textContent = msg;
+      setFabProgress(Math.max(8, pct || 8), 'run', { current: cur, total: total });
+      return 'run';
+    }
+    if (job.status === 'ok') {
+      if (wrap) wrap.hidden = false;
+      if (bar) bar.style.width = '100%';
+      if ($('publishMsg')) $('publishMsg').textContent = job.message || '发布成功';
+      setFabProgress(100, 'ok');
+      return 'ok';
+    }
+    if (job.status === 'error') {
+      if (wrap) wrap.hidden = false;
+      if (bar) bar.style.width = (pct || 100) + '%';
+      if ($('publishMsg')) $('publishMsg').textContent = job.message || '发布失败';
+      setFabProgress(pct || 100, 'err');
+      return 'err';
+    }
+    return job.status || 'idle';
   }
 
   function isCardMode() {
@@ -396,36 +451,20 @@
     publishTimer = setInterval(async function () {
       try {
         var data = await api('/api/bridge/publish');
-        var job = data.job || {};
-        var wrap = $('publishBarWrap');
-        var bar = $('publishBar');
-        var pct = Number(job.percent) || 0;
-        if (job.status === 'running') {
-          wrap.hidden = false;
-          bar.style.width = Math.max(8, pct || 10) + '%';
-          $('publishMsg').textContent = job.message || '发布中…';
-          setFabProgress(Math.max(8, pct || 10), 'run');
-        } else {
-          wrap.hidden = job.status !== 'ok' && job.status !== 'error';
-          bar.style.width = job.status === 'ok' ? '100%' : pct + '%';
-          if (job.status === 'ok') {
-            $('publishMsg').textContent = job.message || '发布成功';
-            setFabProgress(100, 'ok');
-            showMsg('发布成功', true);
-            stopPublishPoll();
-            setBusy(false);
-            setTimeout(function () { setFabProgress(0, 'idle'); }, 1600);
-          } else if (job.status === 'error') {
-            $('publishMsg').textContent = job.message || '发布失败';
-            setFabProgress(pct || 100, 'err');
-            showMsg(job.message || '发布失败', false);
-            stopPublishPoll();
-            setBusy(false);
-            setTimeout(function () { setFabProgress(0, 'idle'); }, 2200);
-          }
+        var state = applyPublishJob(data.job || {});
+        if (state === 'ok') {
+          showMsg('发布成功', true);
+          stopPublishPoll();
+          setBusy(false);
+          setTimeout(function () { setFabProgress(0, 'idle'); }, 1600);
+        } else if (state === 'err') {
+          showMsg((data.job && data.job.message) || '发布失败', false);
+          stopPublishPoll();
+          setBusy(false);
+          setTimeout(function () { setFabProgress(0, 'idle'); }, 2200);
         }
       } catch (_) {}
-    }, 900);
+    }, 350);
   }
 
   async function runPublish(options) {
@@ -461,6 +500,7 @@
         return;
       }
       startPublishPoll();
+      if (data.job) applyPublishJob(data.job);
     } catch (e) {
       showMsg(String(e.message || e), false);
       setFabProgress(100, 'err');
@@ -552,6 +592,33 @@
     }
   }
 
+  /** 角色卡模式：卸掉游戏预览/桥接/同步 UI，只留登录态给写卡与试玩。 */
+  function detachGameRuntime() {
+    stopBridgePoll();
+    stopCloudPreviewPoll();
+    stopPublishPoll();
+    var frame = $('previewFrame');
+    if (frame) {
+      frame.dataset.url = '';
+      frame.src = 'about:blank';
+    }
+    setStageLive(false);
+    renderBridge(null, { running: false, message: '角色卡模式' });
+    var meta = $('previewMeta');
+    if (meta) meta.textContent = '角色卡模式 · 游戏预览已停用';
+    var link = $('previewLink');
+    if (link) link.href = '#';
+    var fab = $('fabDock');
+    if (fab) fab.hidden = true;
+  }
+
+  function persistConsoleMode(mode) {
+    return api('/api/console-mode', {
+      method: 'POST',
+      body: JSON.stringify({ mode: mode }),
+    }).catch(function () { return null; });
+  }
+
   function switchPanel(name, opts) {
     opts = opts || {};
     if (!name) return;
@@ -595,6 +662,7 @@
   function switchConsoleMode(mode, opts) {
     opts = opts || {};
     mode = mode === 'card' ? 'card' : 'game';
+    var prev = consoleMode;
     consoleMode = mode;
     try { localStorage.setItem(CONSOLE_MODE_KEY, mode); } catch (_) {}
 
@@ -604,6 +672,17 @@
     var sidebar = $('sidebar');
     if (sidebar) sidebar.classList.toggle('is-card-console', mode === 'card');
     if ($('agentToggleBtn')) $('agentToggleBtn').hidden = mode === 'card';
+
+    if (mode === 'card') {
+      detachGameRuntime();
+      if (prev !== 'card' || opts.forcePersist) {
+        persistConsoleMode('card').then(function (data) {
+          if (data && data.status) fillForm(data.status, { skipPreview: true });
+        });
+      }
+    } else if (prev === 'card' || opts.forcePersist) {
+      persistConsoleMode('game');
+    }
 
     if (opts.skipPanel) return;
 
@@ -1980,21 +2059,35 @@
       lamp.className = 'lamp off';
       lamp.textContent = '未登录';
     }
-    $('statusBox').textContent = JSON.stringify({
-      loggedIn: status.loggedIn,
-      email: status.emailMasked || status.email,
-      remainSec: status.remainSec,
-      characterId: status.characterId,
-      projectPath: status.projectPath || '(未设置)',
-      previewPort: status.previewPort,
-      origin: status.origin || '',
-      workbenchUrl: status.workbenchUrl || '',
-      kitRoot: status.kitRoot,
-      hasPassword: status.hasPassword,
-      error: status.error || '',
-    }, null, 2);
-    if (status.pull) renderPull(status.pull);
-    if (!opts.skipPreview && status.preview) renderPreview(status.preview);
+    if (consoleMode === 'card') {
+      // 角色卡只要账号态：登录 / 线路 / 剩余时长；不展示游戏 characterId / 工程路径
+      $('statusBox').textContent = JSON.stringify({
+        mode: 'card',
+        loggedIn: status.loggedIn,
+        email: status.emailMasked || status.email,
+        remainSec: status.remainSec,
+        origin: status.origin || '',
+        hasPassword: status.hasPassword,
+        error: status.error || '',
+      }, null, 2);
+    } else {
+      $('statusBox').textContent = JSON.stringify({
+        loggedIn: status.loggedIn,
+        email: status.emailMasked || status.email,
+        remainSec: status.remainSec,
+        characterId: status.characterId,
+        projectPath: status.projectPath || '(未设置)',
+        previewPort: status.previewPort,
+        origin: status.origin || '',
+        workbenchUrl: status.workbenchUrl || '',
+        kitRoot: status.kitRoot,
+        hasPassword: status.hasPassword,
+        error: status.error || '',
+      }, null, 2);
+    }
+    if (status.pull && consoleMode === 'game') renderPull(status.pull);
+    if (!opts.skipPreview && status.preview && consoleMode === 'game') renderPreview(status.preview);
+    if (consoleMode === 'card') detachGameRuntime();
   }
 
   async function api(path, options) {
@@ -3406,8 +3499,12 @@
       if (asDraft || data.mode === 'draft') {
         showMsg('草稿已保存 · id=' + (data.cloudId || ''), true);
       } else {
+        var draftId = data.syncedDraftId || (data.draftSync && data.draftSync.draftId) || '';
+        var draftHint = draftId
+          ? (' · 已同步创作草稿 #' + draftId + '（官网列表看的是这份）')
+          : '';
         showMsg(
-          '已保存 · #' + data.cloudId + '（上架请去官网）' +
+          '已保存正式卡 · #' + data.cloudId + draftHint + '（上架请去官网）' +
             (data.characterUrl ? (' · ' + data.characterUrl) : ''),
           true
         );
@@ -5017,17 +5114,17 @@
     var savedCardId = '';
     try { savedCardId = localStorage.getItem(CONSOLE_CARD_KEY) || ''; } catch (_) {}
     if (savedMode === 'card' || savedMode === 'game') {
-      switchConsoleMode(savedMode);
+      switchConsoleMode(savedMode, { forcePersist: true });
     } else {
-      // 首次使用：游戏卡 + 账号登录
-      switchConsoleMode('game', { panel: 'login' });
+      // 首次使用：默认角色卡（写卡只需登录态；游戏预览不自动拉起）
+      switchConsoleMode('card', { forcePersist: true });
     }
     // 角色卡模式：恢复上次打开的卡夹（刷新后不再是空白错误页）
     if ((savedMode === 'card' || consoleMode === 'card') && savedCardId) {
       openLocalCard(savedCardId).catch(function () {});
     }
   } catch (_) {
-    switchConsoleMode('game', { panel: 'login' });
+    switchConsoleMode('card', { forcePersist: true });
   }
 
   document.addEventListener('keydown', function (ev) {
@@ -5037,6 +5134,10 @@
   });
 
   refresh().then(function (status) {
+    if (consoleMode === 'card') {
+      detachGameRuntime();
+      return;
+    }
     if (status && status.pull && status.pull.running) {
       setBusy(true);
       startPullPoll();

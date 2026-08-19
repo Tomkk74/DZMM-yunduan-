@@ -1561,7 +1561,7 @@ def _delete_drafts_for_character(character_id: int, *, except_draft_id: int | No
     """删除指向同一正式卡的全部草稿。"""
     character_id = int(character_id)
     removed = []
-    for it in list_cloud_cards():
+    for it in list_cloud_cards(enrich_listing=False):
         if not it.get("isDraft"):
             continue
         draft_id = int(it.get("cloudId") or 0)
@@ -1996,14 +1996,25 @@ def publish_to_cloud(local_id: str, *, as_draft: bool = False) -> dict:
     new_id = int(result.get("id") or db_id or 0)
     if new_id <= 0:
         raise RuntimeError(f"云端保存成功但未返回 id: {result}")
+
+    # 官网创作列表：有关联草稿时优先显示草稿；隐藏的正式卡甚至只出现草稿。
+    # 因此「保存到云端」在写正式卡后，必须把同内容同步进草稿，否则看起来像没保存。
+    raw_data["data"]["db_id"] = new_id
+    draft_sync = _sync_character_draft(new_id, raw_data, prefer_draft_id=meta.get("draftId"))
+
     # 重新读盘：保留本地相对路径；只写入云端 id / meta
     card = load_from_folder(local_id)
     meta = card.get("_meta") if isinstance(card.get("_meta"), dict) else {}
     card["data"]["db_id"] = new_id
     meta["cloudId"] = new_id
     meta["source"] = "cloud"
-    meta.pop("draftId", None)
-    meta.pop("draftVersion", None)
+    if draft_sync.get("draftId"):
+        meta["draftId"] = draft_sync["draftId"]
+        if draft_sync.get("draftVersion") is not None:
+            meta["draftVersion"] = draft_sync["draftVersion"]
+    else:
+        meta.pop("draftId", None)
+        meta.pop("draftVersion", None)
     card["_meta"] = meta
     saved = write_folder(card, local_id=local_id)
     return {
@@ -2012,7 +2023,103 @@ def publish_to_cloud(local_id: str, *, as_draft: bool = False) -> dict:
         "cloudId": new_id,
         "characterUrl": f"{studio.get_origin()}/character/{new_id}",
         "result": result,
+        "draftSync": draft_sync,
+        "clearedDrafts": [],
+        "clearedDraftCount": 0,
+        "syncedDraftId": draft_sync.get("draftId"),
     }
+
+
+def _find_draft_ids_for_character(character_id: int) -> list[int]:
+    character_id = int(character_id)
+    found: list[int] = []
+    for it in list_cloud_cards(enrich_listing=False):
+        if not it.get("isDraft"):
+            continue
+        draft_id = int(it.get("cloudId") or 0)
+        if draft_id <= 0:
+            continue
+        linked = it.get("characterId") or it.get("dbId")
+        try:
+            linked = int(linked) if linked is not None else 0
+        except (TypeError, ValueError):
+            linked = 0
+        if linked == character_id:
+            found.append(draft_id)
+    return found
+
+
+def _formal_visible_in_list(character_id: int) -> bool:
+    character_id = int(character_id)
+    for it in list_cloud_cards(enrich_listing=False):
+        if it.get("isDraft"):
+            continue
+        if int(it.get("cloudId") or 0) == character_id:
+            return True
+    return False
+
+
+def _sync_character_draft(
+    character_id: int,
+    raw_data: dict,
+    *,
+    prefer_draft_id=None,
+) -> dict:
+    """把正式卡内容写进关联草稿；没有草稿且正式卡不在列表时新建草稿。"""
+    character_id = int(character_id)
+    try:
+        prefer = int(prefer_draft_id) if prefer_draft_id is not None else 0
+    except (TypeError, ValueError):
+        prefer = 0
+    draft_ids = _find_draft_ids_for_character(character_id)
+    targets = []
+    if prefer > 0:
+        targets.append(prefer)
+    for did in draft_ids:
+        if did not in targets:
+            targets.append(did)
+
+    synced: list[dict] = []
+    last: dict = {}
+    for draft_id in targets:
+        payload: dict = {"rawData": raw_data, "id": draft_id}
+        try:
+            # 带上 baseVersion 更稳，但缺了也能覆盖；失败再无 version 重试
+            result = _trpc_post("studio.saveDraft", payload)
+            row = {
+                "draftId": int(result.get("id") or draft_id),
+                "draftVersion": result.get("version"),
+                "ok": True,
+                "result": result,
+            }
+            synced.append(row)
+            last = row
+        except Exception as e:
+            synced.append({"draftId": draft_id, "ok": False, "error": str(e)})
+
+    if synced and any(x.get("ok") for x in synced):
+        return {
+            "draftId": last.get("draftId"),
+            "draftVersion": last.get("draftVersion"),
+            "action": "updated",
+            "synced": synced,
+        }
+
+    # 无可用草稿：若正式卡已在创作列表可见则不必建草稿；隐藏卡则新建以便官网能打开
+    if _formal_visible_in_list(character_id):
+        return {"draftId": None, "action": "skipped", "synced": synced, "reason": "formal-visible"}
+
+    try:
+        result = _trpc_post("studio.saveDraft", {"rawData": raw_data})
+        return {
+            "draftId": int(result.get("id") or 0) or None,
+            "draftVersion": result.get("version"),
+            "action": "created",
+            "result": result,
+            "synced": synced,
+        }
+    except Exception as e:
+        return {"draftId": None, "action": "failed", "error": str(e), "synced": synced}
 
 
 def _find_local_id_by_cloud_id(cloud_id: int) -> str | None:

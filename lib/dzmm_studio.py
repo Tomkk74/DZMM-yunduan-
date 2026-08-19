@@ -21,9 +21,13 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import http.client as http_client
 import json
 import mimetypes
+import os
+import random
 import re
+import ssl
 import sys
 import time
 import urllib.error
@@ -56,6 +60,30 @@ BUILTIN_ORIGINS = [
 ORIGIN = DEFAULT_ORIGIN
 AUTH_REFRESH_SKEW = 180  # refresh when < 3 minutes left
 DEFAULT_CARD_ID = 0
+HTTP_RETRY_ATTEMPTS = 5
+HTTP_RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
+_TRANSIENT_NET_MARKERS = (
+    "unexpected_eof",
+    "eof occurred in violation of protocol",
+    "ssleoferror",
+    "ssl: unexpected_eof",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "broken pipe",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "temporary failure",
+    "winerror 10054",
+    "winerror 10053",
+    "winerror 10060",
+    "remote end closed",
+    "remotely closed",
+    "incomplete read",
+    "bad handshake",
+    "the handshake operation timed out",
+)
 
 
 def normalize_origin(raw) -> str:
@@ -198,10 +226,44 @@ _CONFIG_LOAD_ERROR = ""
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
+    """Write text atomically; on Windows tolerate locked destinations (editor/AV)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    last_err: Exception | None = None
+    for attempt in range(8):
+        try:
+            # Clear read-only if someone set it; ignore failures.
+            try:
+                if path.exists() and not os.access(path, os.W_OK):
+                    path.chmod(path.stat().st_mode | 0o200)
+            except Exception:
+                pass
+            os.replace(tmp, path)
+            return
+        except PermissionError as e:
+            last_err = e
+            time.sleep(0.05 * (attempt + 1))
+        except OSError as e:
+            # WinError 5 / sharing violation often surfaces as PermissionError or OSError
+            last_err = e
+            if getattr(e, "winerror", None) not in (5, 32) and e.errno not in (13, 11):
+                break
+            time.sleep(0.05 * (attempt + 1))
+    # Fallback: overwrite in place (still better than crashing the console request)
+    try:
+        path.write_text(text, encoding="utf-8")
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return
+    except Exception as e:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise last_err or e
 
 
 def load_config() -> dict:
@@ -962,29 +1024,89 @@ def load_auth(min_remain: int = 60):
     )
 
 
-def http(url, cookie, token, method="GET", data=None, raw_body=None, content_type=None, timeout=120, accept="*/*"):
-    headers = {
-        "Cookie": cookie,
-        "Authorization": f"Bearer {token}",
-        "User-Agent": "Mozilla/5.0 DZMM-Studio-Bridge",
-        "Accept": accept,
-        "Referer": f"{get_origin()}/studio/game-creation/workbench?character_id={DEFAULT_CARD_ID}",
-        "Origin": get_origin(),
-        "x-dzmm-request-id": f"studio{int(time.time()) % 10_000_000}",
-    }
-    body = None
-    if raw_body is not None:
-        body = raw_body
-        headers["Content-Type"] = content_type or "application/octet-stream"
-    elif data is not None:
-        body = json.dumps(data).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, resp.read(), dict(resp.headers)
-    except urllib.error.HTTPError as e:
-        return e.code, e.read(), dict(e.headers)
+def _is_transient_http_error(exc: BaseException) -> bool:
+    """CDN / 容器代理掐 TLS、空闲断开、超时：应重试，不是业务失败。"""
+    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+        return False
+    if isinstance(exc, urllib.error.HTTPError):
+        return int(getattr(exc, "code", 0) or 0) in HTTP_RETRY_STATUSES
+    if isinstance(
+        exc,
+        (
+            TimeoutError,
+            ConnectionError,
+            BrokenPipeError,
+            InterruptedError,
+            ssl.SSLError,
+            http_client.IncompleteRead,
+            http_client.RemoteDisconnected,
+            http_client.BadStatusLine,
+        ),
+    ):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, BaseException) and _is_transient_http_error(reason):
+            return True
+        text = f"{exc} {reason or ''}".lower()
+        return any(m in text for m in _TRANSIENT_NET_MARKERS)
+    if isinstance(exc, OSError):
+        text = str(exc).lower()
+        return any(m in text for m in _TRANSIENT_NET_MARKERS)
+    text = str(exc).lower()
+    if any(m in text for m in ("http 408", "http 429", "http 500", "http 502", "http 503", "http 504")):
+        return True
+    return any(m in text for m in _TRANSIENT_NET_MARKERS)
+
+
+def _sleep_http_retry(attempt: int) -> None:
+    delay = min(8.0, 0.45 * (2 ** max(0, attempt - 1)))
+    delay += random.uniform(0, 0.25)
+    time.sleep(delay)
+
+
+def http(url, cookie, token, method="GET", data=None, raw_body=None, content_type=None, timeout=120, accept="*/*", connection_close: bool = True):
+    """Workbench / 代理 HTTP。SSL EOF、502 等瞬时失败自动退避重试。"""
+    last_exc: BaseException | None = None
+    for attempt in range(1, HTTP_RETRY_ATTEMPTS + 1):
+        headers = {
+            "Cookie": cookie,
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "Mozilla/5.0 DZMM-Studio-Bridge",
+            "Accept": accept,
+            "Referer": f"{get_origin()}/studio/game-creation/workbench?character_id={DEFAULT_CARD_ID}",
+            "Origin": get_origin(),
+            "x-dzmm-request-id": f"studio{int(time.time() * 1000) % 10_000_000}-{attempt}",
+        }
+        if connection_close:
+            headers["Connection"] = "close"
+        body = None
+        if raw_body is not None:
+            body = raw_body
+            headers["Content-Type"] = content_type or "application/octet-stream"
+        elif data is not None:
+            body = json.dumps(data).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, resp.read(), dict(resp.headers)
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            hdrs = dict(e.headers or {})
+            if int(e.code) in HTTP_RETRY_STATUSES and attempt < HTTP_RETRY_ATTEMPTS:
+                last_exc = e
+                _sleep_http_retry(attempt)
+                continue
+            return e.code, raw, hdrs
+        except Exception as e:
+            last_exc = e
+            if attempt >= HTTP_RETRY_ATTEMPTS or not _is_transient_http_error(e):
+                raise
+            _sleep_http_retry(attempt)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("http retry exhausted")
 
 
 def ensure_editor(cookie, token, character_id: int):
@@ -1206,6 +1328,115 @@ def upload_file(cookie, token, game_id: str, local: Path) -> None:
         raise RuntimeError(f"upload failed {remote} HTTP {st}: {raw[:200]!r}")
 
 
+def delete_file(cookie, token, game_id: str, remote: str) -> None:
+    """Delete a file (or empty path) in the Workbench container."""
+    remote = "/" + str(remote or "").replace("\\", "/").lstrip("/")
+    while "//" in remote:
+        remote = remote.replace("//", "/")
+    if remote in ("", "/"):
+        raise ValueError("refuse delete container root")
+    q = urllib.parse.urlencode({"path": remote})
+    st, raw, _ = http(
+        proxy_url(game_id, f"/files?{q}"),
+        cookie,
+        token,
+        method="DELETE",
+        accept="application/json",
+        timeout=60,
+    )
+    if st not in (200, 204):
+        raise RuntimeError(f"delete failed {remote} HTTP {st}: {raw[:200]!r}")
+
+
+def _list_remote_dir(cookie, token, game_id: str, path: str) -> list[dict]:
+    q = urllib.parse.urlencode({"path": path})
+    st, raw, _ = http(
+        proxy_url(game_id, f"/files?{q}"),
+        cookie,
+        token,
+        accept="application/json",
+        timeout=60,
+    )
+    if st != 200:
+        raise RuntimeError(f"list remote {path} HTTP {st}: {raw[:200]!r}")
+    data = json.loads(raw)
+    return data if isinstance(data, list) else []
+
+
+def list_remote_files(cookie, token, game_id: str, path: str = "/") -> list[dict]:
+    """Walk container files (skip .git / node_modules / __pycache__)."""
+    skip_names = {".git", "node_modules", "__pycache__", ".DS_Store"}
+    out: list[dict] = []
+
+    def walk(cur: str) -> None:
+        for e in _list_remote_dir(cookie, token, game_id, cur):
+            name = e.get("name") or ""
+            if name in skip_names:
+                continue
+            p = str(e.get("path") or "").replace("\\", "/")
+            if not p.startswith("/"):
+                p = "/" + p
+            t = e.get("type")
+            if t == "directory":
+                walk(p)
+            elif t == "file":
+                out.append({"path": p, "size": int(e.get("size") or 0), "name": name})
+
+    walk(path if path.startswith("/") else "/" + path)
+    return out
+
+
+def prune_remote_extras(
+    cookie,
+    token,
+    game_id: str,
+    local_files: list[Path] | None = None,
+) -> dict:
+    """Delete container files that are not present in the local sync set.
+
+    Local project is the source of truth. Returns counts + sample paths.
+    列目录走代理 HTTPS：上传刚结束时 CDN/容器常直接掐 TLS（UNEXPECTED_EOF），
+    所以列目录本身会退避重试，避免清理阶段把整次同步打断。
+    """
+    refresh_root()
+    local_files = list(local_files) if local_files is not None else list_local_files()
+    keep = {"/" + p.relative_to(ROOT).as_posix() for p in local_files}
+    # 上传刚结束，容器还在落盘；立刻 GET /files 最容易撞上对端关连接
+    time.sleep(0.4)
+    remote = None
+    last_err: BaseException | None = None
+    for attempt in range(1, 4):
+        try:
+            remote = list_remote_files(cookie, token, game_id, "/")
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            if attempt >= 3 or not _is_transient_http_error(e):
+                raise
+            _sleep_http_retry(attempt + 1)
+    if remote is None:
+        raise last_err or RuntimeError("list remote files failed")
+    extras = [f for f in remote if f.get("path") not in keep]
+    deleted: list[str] = []
+    fails: list[str] = []
+    for f in extras:
+        remote_path = f["path"]
+        try:
+            delete_file(cookie, token, game_id, remote_path)
+            deleted.append(remote_path)
+        except Exception as e:
+            fails.append(f"{remote_path}: {e}")
+    return {
+        "remote": len(remote),
+        "keep": len(keep),
+        "deleted": deleted,
+        "fails": fails,
+        "ok": len(deleted),
+        "fail": len(fails),
+    }
+
+
 def git_save(cookie, token, game_id: str, message: str | None) -> None:
     st, raw, _ = http(
         proxy_url(game_id, "/git/save"),
@@ -1220,22 +1451,122 @@ def git_save(cookie, token, game_id: str, message: str | None) -> None:
         raise SystemExit(f"git save 失败 HTTP {st}: {raw[:300]!r}")
 
 
-def publish(cookie, token, character_id: int) -> None:
-    st, raw, _ = http(
-        f"{get_origin()}/api/gamefy/publish",
-        cookie,
-        token,
-        method="POST",
-        data={"characterId": character_id},
-        timeout=300,
-        accept="application/json",
-    )
-    if st not in (200, 201):
+def publish(cookie, token, character_id: int, on_progress=None) -> dict:
+    """发布到玩家静态包。接口返回 NDJSON 进度流，必须读到上传结束，
+    否则会提前断开，玩家侧大量 JS/图 404。
+    on_progress(ev) 可选：每条进度回调，ev 含 step/uploaded/total/current/message。"""
+    url = f"{get_origin()}/api/gamefy/publish"
+    last: dict = {}
+    uploaded = 0
+    total = 0
+    last_exc: BaseException | None = None
+    for attempt in range(1, HTTP_RETRY_ATTEMPTS + 1):
+        headers = {
+            "Cookie": cookie,
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "Mozilla/5.0 DZMM-Studio-Bridge",
+            "Accept": "*/*",
+            "Content-Type": "application/json",
+            "Referer": f"{get_origin()}/studio/game-creation/workbench?character_id={character_id}",
+            "Origin": get_origin(),
+            "x-dzmm-request-id": f"studio{int(time.time() * 1000) % 10_000_000}-{attempt}",
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps({"characterId": character_id}).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
         try:
-            err = json.loads(raw).get("error")
+            log_path = KIT_ROOT / "tools" / "_last_publish.ndjson"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with urllib.request.urlopen(req, timeout=600) as resp, log_path.open("w", encoding="utf-8") as logf:
+                st = int(resp.status)
+                if st not in (200, 201):
+                    raw = resp.read()[:400]
+                    raise SystemExit(f"发布失败 HTTP {st}: {raw!r}")
+                while True:
+                    line = resp.readline()
+                    if not line:
+                        break
+                    text = line.decode("utf-8", "replace").strip()
+                    if not text:
+                        continue
+                    logf.write(text + "\n")
+                    logf.flush()
+                    try:
+                        obj = json.loads(text)
+                    except Exception:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    last = obj
+                    uploaded = int(obj.get("uploaded") or uploaded or 0)
+                    total = int(obj.get("total") or total or 0)
+                    step = str(obj.get("step") or "")
+                    current = str(obj.get("current") or "").strip()
+                    if callable(on_progress):
+                        try:
+                            on_progress({
+                                "step": step or ("uploading" if total else ""),
+                                "uploaded": uploaded,
+                                "total": total,
+                                "current": current,
+                                "message": str(obj.get("message") or ""),
+                                "heartbeat": bool(obj.get("heartbeat")),
+                            })
+                        except Exception:
+                            pass
+                    if step == "uploading" and total and (uploaded % 25 == 0 or uploaded == total):
+                        print(f"[publish] upload {uploaded}/{total}", flush=True)
+                    elif step and step not in ("uploading",):
+                        print(f"[publish] {step} {obj.get('message') or ''}", flush=True)
+                    if (
+                        obj.get("failed")
+                        or obj.get("failCount")
+                        or obj.get("failedCount")
+                        or obj.get("failedFiles")
+                        or obj.get("fails")
+                        or obj.get("errors")
+                        or obj.get("failedList")
+                    ):
+                        print("[publish] fail-detail", json.dumps(obj, ensure_ascii=False)[:6000], flush=True)
+            break
+        except urllib.error.HTTPError as e:
+            raw = e.read()[:400]
+            if int(e.code) in HTTP_RETRY_STATUSES and attempt < HTTP_RETRY_ATTEMPTS:
+                last_exc = e
+                _sleep_http_retry(attempt)
+                continue
+            raise SystemExit(f"发布失败 HTTP {e.code}: {raw!r}") from e
+        except Exception as e:
+            last_exc = e
+            if attempt >= HTTP_RETRY_ATTEMPTS or not _is_transient_http_error(e):
+                raise
+            print(f"[publish] retry {attempt} after {e}", flush=True)
+            _sleep_http_retry(attempt)
+    else:
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("publish retry exhausted")
+
+    step = str(last.get("step") or "")
+    err = last.get("error") or (last.get("message") if step in ("error", "failed") else "")
+    if step in ("error", "failed") or last.get("ok") is False:
+        dump = KIT_ROOT / "tools" / "_last_publish_error.json"
+        try:
+            dump.write_text(json.dumps(last, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
-            err = raw[:300]
-        raise SystemExit(f"发布失败 HTTP {st}: {err}")
+            pass
+        print("[publish] last=", json.dumps(last, ensure_ascii=False)[:4000], flush=True)
+        raise SystemExit(f"发布失败: {err or last}")
+    if total and uploaded < total:
+        raise SystemExit(
+            f"发布中断：只上传了 {uploaded}/{total} 个文件，玩家包会缺脚本。"
+            "请再点一次发布，并等进度走完。"
+        )
+    print(f"[publish] done uploaded={uploaded}/{total or uploaded} step={step or 'eof'}", flush=True)
+    return last
 
 
 def cmd_login(args):
@@ -1299,7 +1630,9 @@ def cmd_sync(args):
     cookie, token, remain, email = load_auth()
     print(f"login={email} remain_s={remain}")
     _, game_id = ensure_editor(cookie, token, args.character_id)
-    files = list_local_files()
+    all_local = list_local_files()
+    partial = bool(args.only)
+    files = all_local
     if args.only:
         only = {p.replace("\\", "/") for p in args.only}
         files = [f for f in files if f.relative_to(ROOT).as_posix() in only]
@@ -1312,9 +1645,6 @@ def cmd_sync(args):
         print("提示：之后只传有改动的文件；若需全量请加 --full")
         return
     git_pending = bool(meta.get("gitSavePending"))
-    if not to_upload and not git_pending:
-        print("sync: 无变更文件，跳过上传")
-        return
     if mode == "retarget":
         print(
             f"sync: 检测到目标卡 ID 变更，强制全量上传 "
@@ -1338,13 +1668,45 @@ def cmd_sync(args):
             fail += 1
             entries.pop(rel, None)
             print(f"  FAIL {rel}: {e}")
+    keep_rels = {p.relative_to(ROOT).as_posix() for p in all_local}
     if to_upload:
+        entries = {k: v for k, v in entries.items() if k in keep_rels}
         meta["files"] = entries
         meta["character_id"] = int(getattr(args, "character_id", 0) or DEFAULT_CARD_ID or 0)
         save_sync_meta(meta)
         print(f"uploaded ok={ok} fail={fail}")
         if fail:
             raise SystemExit(1)
+    else:
+        prev = dict(meta.get("files") or {})
+        cleaned = {k: v for k, v in prev.items() if k in keep_rels}
+        if cleaned != prev:
+            meta["files"] = cleaned
+            meta["character_id"] = int(getattr(args, "character_id", 0) or DEFAULT_CARD_ID or 0)
+            save_sync_meta(meta)
+
+    deleted_n = 0
+    if not partial:
+        print("prune remote extras…")
+        try:
+            prune = prune_remote_extras(cookie, token, game_id, all_local)
+        except Exception as e:
+            # 文件已在容器工作区；清理失败不应跳过 git save
+            print(f"prune failed (will git save anyway): {e}")
+            prune = {"ok": 0, "fails": [str(e)], "deleted": []}
+        deleted_n = int(prune.get("ok") or 0)
+        for p in (prune.get("deleted") or [])[:20]:
+            print(f"  DEL {p}")
+        if deleted_n > 20:
+            print(f"  … and {deleted_n - 20} more")
+        for line in prune.get("fails") or []:
+            print(f"  DEL FAIL {line}")
+        print(f"pruned deleted={deleted_n} fail={prune.get('fail') or len(prune.get('fails') or [])}")
+
+    need_git = bool(to_upload or deleted_n or git_pending)
+    if not need_git:
+        print("sync: 无变更文件，跳过")
+        return
     if not args.no_git_save:
         print("git save…")
         try:
@@ -1362,6 +1724,8 @@ def cmd_sync(args):
                 meta["files"] = entries
             save_sync_meta(meta)
             raise SystemExit(f"git save 失败（已标记待重试）: {e}") from e
+    else:
+        print("skip git save (--no-git-save)")
 
 
 def cmd_publish(args):

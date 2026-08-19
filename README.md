@@ -24,7 +24,7 @@
 角色卡：  本机 卡/<名>/  ──保存/上云──▶  studio 正式卡  ──试玩──▶  平台 chat API
 ```
 
-首次打开默认进入 **游戏卡 → 账号登录**；顶栏可切换到 **角色卡**。
+首次打开默认进入 **游戏卡 → 账号登录**；顶栏可切换到 **角色卡**。上次选择的模式会写入 `config.json`（`console_mode`），下次启动自动恢复。
 
 ---
 
@@ -96,7 +96,7 @@ Agent 入口：[`AGENTS.md`](AGENTS.md) → [`_模板/AGENTS.md`](_模板/AGENTS
 |:---|:---|
 | 本地编辑 | 基础字段、世界书条目、开场 / 建议回复、头像与封面等；改文件可同步进编辑器 |
 | 云端列表 / 拉取 | 登录后拉取账号下角色卡到本地 |
-| 保存 / 上云 | 本地保存；上云走 `studio.uploadOrUpdate` / 草稿接口（上架下架请官网） |
+| 保存 / 上云 | 本地保存；上云走 `studio.uploadOrUpdate`，并同步已有草稿版本（`studio.saveDraft`）；上架下架请官网 |
 | **试玩** | 仅 **已上云的正式卡**（有 `db_id`）；草稿不可试玩 |
 | 导出 PNG | 先保存卡；封面优先 `image_info`，否则头像；嵌入完整 `chara_card_v3`（`tEXt`：`chara` + `ccv3`） |
 
@@ -120,7 +120,7 @@ Agent 入口：[`AGENTS.md`](AGENTS.md) → [`_模板/AGENTS.md`](_模板/AGENTS
 
 正文优先用 `{{user}}` / `{{char}}`，勿写死玩家名。
 
-> `卡/*/` 默认不进 Git；示例卡「少女的春之梦」已白名单。私密成品请自行留在本机。
+> `卡/*/` 默认不进 Git（仅保留 `卡/README.md` 与 `卡/AGENTS.md`）。私密成品请自行留在本机。
 
 ---
 
@@ -148,7 +148,8 @@ Agent 入口：[`AGENTS.md`](AGENTS.md) → [`_模板/AGENTS.md`](_模板/AGENTS
 | 拉取容器 | 云端整包落地；路径空则默认 `../{character_id}` |
 | 预览 | 顶栏可切 **本地 / 云端**：本地读本机 `publish/`；云端持续镜像容器 `publish` 到旁路目录（不覆盖本地工程）再预览 |
 | 官方助手 | 右侧面板对接 Workbench Chat（Claude / Codex Agent）；需有效游戏卡 `character_id`；改的是云端，可用「云端预览」看效果 |
-| 同步 | 对照 `_sync_meta.json` 增量上传；**换卡 / 无 pull 基线会自动全量**；失败文件会保留待重试；强制全量加 `--full` |
+| 同步 | 对照 `_sync_meta.json` 增量上传；**换卡 / 无 pull 基线会自动全量**；上传后会 **清理容器多余文件**（本地已删的远端也会删）；网络抖动自动重试；失败文件保留待重试；强制全量加 `--full` |
+| 发布 | 悬浮按钮显示进度；完成后自动复位 |
 
 ### 界面截图
 
@@ -215,7 +216,7 @@ Telegram 登录请用网页控制台「账号登录 → Telegram」（需扫码/
 | 本机文件（勿提交） | 说明 |
 |:---|:---|
 | `.env` | 邮箱 / 密码 / cookie |
-| `config.json` | 游戏卡 `character_id`、项目路径、预览端口 |
+| `config.json` | 游戏卡 `character_id`、项目路径、预览端口、`console_mode`（`game` / `card`） |
 
 也可只在网页里保存配置，无需手改文件：
 
@@ -262,7 +263,7 @@ copy .env.example .env
 <details>
 <summary><b>预览空白？（游戏卡）</b></summary>
 
-本地路径是否指向含 `publish/index.html` 的目录；先停止再启动预览；看「运行状态」报错。
+本地路径是否指向含 `publish/index.html` 的目录；先停止再启动预览；看「运行状态」报错。若 KV / 云端接口返回验证码（418），预览页会自动弹出官网验证页，完成后再试。
 </details>
 
 <details>

@@ -25,6 +25,49 @@ ROOT = Path(__file__).resolve().parents[1]  # overwritten by --project-root
 PUBLISH_DIR = ROOT / "publish"  # may equal ROOT for flat player packages
 DEFAULT_CARD_ID = 0
 DEFAULT_PORT = 8791
+_CAPTCHA_OPEN_AT = 0.0
+
+
+def _raw_text(raw) -> str:
+    if raw is None:
+        return ""
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", "ignore")
+    return str(raw)
+
+
+def _is_captcha_response(st: int, raw) -> bool:
+    if int(st or 0) == 418:
+        return True
+    text = _raw_text(raw).lower()
+    return "captcha_required" in text or "/__captcha/" in text
+
+
+def _open_preview_captcha(raw="") -> str:
+    global _CAPTCHA_OPEN_AT
+    text = _raw_text(raw)
+    loc = "/__captcha/"
+    m = re.search(r'"location"\s*:\s*"([^"]+)"', text)
+    if m:
+        loc = m.group(1).strip() or loc
+        if not loc.startswith("/"):
+            loc = "/" + loc
+    url = f"{_origin().rstrip('/')}{loc}"
+    now = time.time()
+    if now - _CAPTCHA_OPEN_AT >= 8.0:
+        _CAPTCHA_OPEN_AT = now
+
+        def _open():
+            try:
+                webbrowser.open(url)
+            except Exception as err:
+                print(f"[preview] 打开验证码页失败: {err}", flush=True)
+
+        threading.Thread(target=_open, name="preview-captcha", daemon=True).start()
+        print(f"[preview] captcha required, opened {url}", flush=True)
+    return url
+
+
 def _origin() -> str:
     try:
         mod = load_studio()
@@ -66,11 +109,24 @@ BRIDGE_JS = r"""
     try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
     if (!res.ok) {
       const err = new Error((data && (data.error || data.message)) || ("HTTP " + res.status));
-      err.code = (data && data.code) || "HTTP_" + res.status;
+      err.code = (data && data.code) || (res.status === 418 ? "captcha_required" : ("HTTP_" + res.status));
       err.status = res.status;
       throw err;
     }
     return data;
+  }
+
+  let kvCaptchaWarned = false;
+  function noteKvCloudFail(op, key, e) {
+    const msg = String((e && e.message) || "");
+    const captcha = (e && (e.status === 418 || e.code === "captcha_required")) || /captcha|teapot/i.test(msg);
+    if (captcha) {
+      if (kvCaptchaWarned) return;
+      kvCaptchaWarned = true;
+      console.warn("[local-dzmm] kv cloud captcha, using local for this session");
+      return;
+    }
+    console.warn("[local-dzmm] kv." + op + " cloud fail, " + (op === "put" ? "kept local" : "try local"), key, msg);
   }
 
   async function completions(config, onChunk) {
@@ -247,7 +303,7 @@ BRIDGE_JS = r"""
             return toRaShape(data.value);
           }
         } catch (e) {
-          console.warn("[local-dzmm] kv.get cloud fail, try local", key, e.message);
+          noteKvCloudFail("get", key, e);
         }
         if (kvMem.has(key)) return toRaShape(kvMem.get(key));
         const local = kvLsRead(key);
@@ -263,7 +319,7 @@ BRIDGE_JS = r"""
         try {
           await api("/kv/put", { method: "POST", body: { key, value } });
         } catch (e) {
-          console.warn("[local-dzmm] kv.put cloud fail, kept local", key, e.message);
+          noteKvCloudFail("put", key, e);
         }
       },
       async delete(key) {
@@ -425,16 +481,19 @@ class PreviewState:
                 return
 
             auth_changed = (token != self.token) or (email != self.email) or (cookie != self.cookie)
+            account_changed = (email != self.email)
             # 登录态仍够用时跳过重活，但账号/cookie 一旦变化必须立刻重拉昵称
             if not force and not auth_changed and self._remain_now() > 90 and self.chat_id:
                 self.cookie, self.token, self.remain, self.email = cookie, token, remain, email
                 self.auth_checked_at = time.time()
                 return
 
-            if auth_changed:
+            # 仅换账号才清 chatId。cookie/token 轮换时保留，避免 KV 窗口期狂报 503。
+            if account_changed:
                 self.display_name = ""
                 self.chat_id = ""
 
+            prev_chat = self.chat_id
             self.cookie, self.token, self.remain, self.email = cookie, token, remain, email
             self.auth_checked_at = time.time()
             try:
@@ -461,9 +520,17 @@ class PreviewState:
                     accept="application/json",
                 )
                 if st == 200:
-                    self.chat_id = json.loads(raw).get("chatId") or self.chat_id
+                    new_chat = json.loads(raw).get("chatId") or ""
+                    if new_chat:
+                        self.chat_id = str(new_chat)
+                    elif not self.chat_id:
+                        self.chat_id = prev_chat
+                elif not self.chat_id:
+                    self.chat_id = prev_chat
             except Exception as e:
                 print(f"[preview] dev-chat fail (KV/云端暂不可用): {e}")
+                if not self.chat_id:
+                    self.chat_id = prev_chat
             try:
                 q = urllib.parse.quote(json.dumps({"0": {"json": {}}}, separators=(",", ":")))
                 st_me, raw_me, _ = self.studio.http(
@@ -482,7 +549,7 @@ class PreviewState:
                         full = str(me.get("fullName") or me.get("name") or "").strip()
                         if full:
                             self.display_name = full[:40]
-                        elif auth_changed or force or not self.display_name:
+                        elif account_changed or force or not self.display_name:
                             self.display_name = ""
             except Exception as e:
                 print(f"[preview] user name fail: {e}")
@@ -493,6 +560,7 @@ class PreviewState:
                 f"remain={self._remain_now()}s gameId={self.game_id} "
                 f"chatId={(self.chat_id or '')[:8] or '—'}… status={(info or {}).get('status')}"
                 f"{' [auth-changed]' if auth_changed else ''}{' [force]' if force else ''}"
+                f"{' [account-changed]' if account_changed else ''}"
             )
 
     def _set_publish_job(self, **kwargs):
@@ -527,21 +595,64 @@ class PreviewState:
                 cookie, token = self.cookie, self.token
                 if not cookie or not token:
                     raise RuntimeError("未登录，无法发布")
-                self._set_publish_job(phase="publish", percent=40, message="正在发布到线上玩家版…")
-                try:
-                    self.studio.publish(cookie, token, self.character_id)
-                except SystemExit as e:
-                    raise RuntimeError(str(e)) from e
+                self._set_publish_job(phase="publish", percent=12, message="正在发布到线上玩家版…")
+
+                def on_progress(ev):
+                    ev = ev or {}
+                    uploaded = int(ev.get("uploaded") or 0)
+                    total = int(ev.get("total") or 0)
+                    step = str(ev.get("step") or "")
+                    name = str(ev.get("current") or "").strip()
+                    raw_msg = str(ev.get("message") or "").strip()
+                    if step == "uploading" and total > 0:
+                        pct = min(97, max(38, 38 + int(59 * uploaded / total)))
+                        msg = f"发布中 {uploaded}/{total}"
+                        if name:
+                            msg += f" · {name}"
+                        elif raw_msg and "上传文件" not in raw_msg:
+                            msg += f" · {raw_msg}"
+                    elif step == "validate":
+                        pct, msg = 12, raw_msg or "验证权限…"
+                    elif step == "saving":
+                        pct, msg = 18, raw_msg or "保存代码…"
+                    elif step == "collecting":
+                        pct, msg = 28, raw_msg or "收集文件…"
+                    elif step:
+                        pct = 32
+                        msg = raw_msg or "正在发布…"
+                    else:
+                        return
+                    self._set_publish_job(
+                        phase="publish",
+                        percent=pct,
+                        current=uploaded,
+                        total=total,
+                        synced=uploaded,
+                        currentFile=name,
+                        message=msg,
+                    )
+
+                result = self.studio.publish(
+                    cookie, token, self.character_id, on_progress=on_progress
+                )
+                uploaded = int((result or {}).get("uploaded") or 0)
+                total = int((result or {}).get("total") or 0)
                 self._set_publish_job(
                     status="ok",
                     phase="done",
                     percent=100,
-                    message="发布成功 · 已上线玩家版",
+                    current=uploaded or total,
+                    message=(
+                        f"发布成功 · 已上线玩家版 {uploaded}/{total}"
+                        if total else "发布成功 · 已上线玩家版"
+                    ),
                     finishedAt=time.time(),
                     currentFile="",
+                    synced=uploaded,
+                    total=total,
                 )
                 print("[preview] publish ok")
-            except Exception as e:
+            except (SystemExit, Exception) as e:
                 self._set_publish_job(
                     status="error",
                     phase="done",
@@ -761,9 +872,30 @@ def make_handler(state: PreviewState):
                 return self.proxy_draw_models(kind)
             if path == "/_dzmm/studio/publish":
                 return self._send(200, json.dumps(state.publish_status(), ensure_ascii=False).encode("utf-8"), "application/json")
+            if path == "/_dzmm/proxy-image":
+                return self.proxy_draw_image(parsed)
             if path.startswith("/static/"):
                 return self.proxy_static(path[len("/static/") :])
-            if path.startswith("/assets/") or path.endswith((".json", ".js", ".css", ".png", ".jpg", ".webp", ".mp3", ".ogg", ".html")):
+            # Ren'Py Web 常请求 /game/...（无 /static 前缀）；视频用 <video src> 不走 fetch
+            if path.startswith("/game/") or path.startswith("/assets/") or path.endswith(
+                (
+                    ".json",
+                    ".js",
+                    ".css",
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
+                    ".webp",
+                    ".webm",
+                    ".mp3",
+                    ".ogg",
+                    ".mp4",
+                    ".wasm",
+                    ".data",
+                    ".zip",
+                    ".html",
+                )
+            ):
                 return self.proxy_static(path.lstrip("/"))
             self._send(404, b"not found")
 
@@ -945,7 +1077,18 @@ def make_handler(state: PreviewState):
         def proxy_kv(self, method: str, key, data=None):
             """REST: /api/gamefy/{chatId}/kv/{key}  GET→{value} PUT body={value} DELETE"""
             if not state.chat_id:
-                return self._send(503, json.dumps({"error": "chatId not ready"}).encode(), "application/json")
+                # cookie 轮换窗口或启动竞态：补一次 refresh，仍没有再降级本地
+                try:
+                    state.refresh(force=False)
+                except Exception as e:
+                    print(f"[preview] kv ensure chatId fail: {e}", flush=True)
+            if not state.chat_id:
+                # 不带 value：bridge 会落到本地 KV，避免写成 null 冲掉解锁进度
+                return self._send(
+                    200,
+                    json.dumps({"ok": False, "localOnly": True, "error": "chatId not ready"}).encode(),
+                    "application/json",
+                )
             key = str(key or "").strip()
             if not key or "/" in key or "\\" in key:
                 return self._send(400, json.dumps({"error": "invalid kv key"}).encode(), "application/json")
@@ -962,8 +1105,11 @@ def make_handler(state: PreviewState):
             except Exception as e:
                 print(f"[preview] kv {method} cloud fail {key}: {e}")
                 payload = {"ok": False, "localOnly": True, "error": str(e)}
-                if method == "GET":
-                    payload = {"value": None, "error": str(e)}
+                return self._send(200, json.dumps(payload, ensure_ascii=False).encode("utf-8"), "application/json")
+            if _is_captcha_response(st, raw):
+                _open_preview_captcha(raw)
+                payload = {"ok": False, "localOnly": True, "error": "captcha_required"}
+                print(f"[preview] kv {method} {key} -> localOnly (captcha_required)", flush=True)
                 return self._send(200, json.dumps(payload, ensure_ascii=False).encode("utf-8"), "application/json")
             # 对齐 SDK：get 返回 value；缺 key 时上游可能 404 或空
             if method == "GET" and st == 200:
@@ -1053,6 +1199,75 @@ def make_handler(state: PreviewState):
                 return _origin() + url
             return url
 
+        def _local_draw_image(self, url: str) -> str:
+            """本地预览把平台画图链改写为同源代理，便于展示与 canvas/上架转存。"""
+            abs_url = self._abs_draw_image(url)
+            if not abs_url:
+                return abs_url
+            return "/_dzmm/proxy-image?url=" + urllib.parse.quote(abs_url, safe="")
+
+        def _allowed_proxy_image_url(self, url: str) -> bool:
+            try:
+                parsed = urllib.parse.urlparse(url)
+            except Exception:
+                return False
+            if parsed.scheme not in ("http", "https"):
+                return False
+            host = (parsed.hostname or "").lower()
+            if not host:
+                return False
+            allow_suffixes = (
+                "dzmm.ai",
+                "dzmm.io",
+                "aifukk.com",
+                "fuckaibot.com",
+                "thottai.com",
+                "aicbnv.com",
+                "aikda.com",
+                "ainvmei.com",
+                "girlloveai.com",
+                "meimoaidao.com",
+                "loreveil.xyz",
+                "museloom.xyz",
+                "echolore.xyz",
+            )
+            return any(host == s or host.endswith("." + s) for s in allow_suffixes)
+
+        def proxy_draw_image(self, parsed):
+            qs = urllib.parse.parse_qs(parsed.query or "")
+            url = str((qs.get("url") or [""])[0] or "").strip()
+            if not url or not self._allowed_proxy_image_url(url):
+                return self._send(400, b'{"error":"invalid image url"}', "application/json")
+            try:
+                # 带 access token 的画图链用上游 cookie 更稳；失败再裸拉
+                st, raw, headers = state.upstream("GET", url, accept="image/*,*/*")
+                if st >= 400 or not raw:
+                    req = urllib.request.Request(
+                        url,
+                        headers={
+                            "User-Agent": "Mozilla/5.0 DZMM-Local-Preview",
+                            "Accept": "image/*,*/*",
+                            "Referer": _origin() + "/",
+                        },
+                        method="GET",
+                    )
+                    with urllib.request.urlopen(req, timeout=45) as resp:
+                        raw = resp.read()
+                        headers = dict(resp.headers)
+                        st = resp.status
+                if st >= 400 or not raw:
+                    return self._send(502, b'{"error":"image fetch failed"}', "application/json")
+                ctype = str(headers.get("Content-Type") or headers.get("content-type") or "image/jpeg").split(";")[0].strip()
+                if not ctype.startswith("image/"):
+                    ctype = "image/jpeg"
+                return self._send(200, raw, ctype)
+            except Exception as e:
+                return self._send(
+                    502,
+                    json.dumps({"error": f"image proxy failed: {e}"}).encode("utf-8"),
+                    "application/json",
+                )
+
         def proxy_draw_generate(self, body: dict):
             """对齐真实 SDK：POST /draw 创建任务，再轮询 /draw/status 直到 completed。"""
             payload = dict(body or {})
@@ -1126,7 +1341,7 @@ def make_handler(state: PreviewState):
                         )
                     result = {
                         "taskId": task_id,
-                        "images": [self._abs_draw_image(str(u)) for u in images],
+                        "images": [self._local_draw_image(str(u)) for u in images],
                         "createdAt": task.get("createdAt") or "",
                         "status": status or "completed",
                         "errorMessage": task.get("errorMessage") or None,
